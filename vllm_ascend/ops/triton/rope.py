@@ -43,7 +43,6 @@ def _triton_rope(
     rope_dim: tl.constexpr,
     pad_n_qh: tl.constexpr,
     pad_n_kh: tl.constexpr,
-    pad_rope_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     IS_NEOX_STYLE: tl.constexpr,
     USE_COS_SIN: tl.constexpr,
@@ -87,8 +86,8 @@ def _triton_rope(
         # get the cos(mθ_{i...d/2}) and sin(mθ_{i...d/2}) for token position
         # m of this program instance
         # ####################################################################
-        cos_offsets = tl.arange(0, pad_rope_dim // 2)
-        sin_offsets = tl.arange(pad_rope_dim // 2, pad_rope_dim)
+        cos_offsets = tl.arange(0, rope_dim // 2)
+        sin_offsets = tl.arange(rope_dim // 2, rope_dim)
         cos_mask = cos_offsets < (rope_dim // 2)
         if USE_COS_SIN:
             pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
@@ -107,17 +106,17 @@ def _triton_rope(
         # ####################################################################
         # left half of the head
         if IS_NEOX_STYLE:
-            first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_rope_dim // 2)[None, :]
-            first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, pad_rope_dim // 2)[None, :]
+            first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, rope_dim // 2)[None, :]
+            first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, rope_dim // 2)[None, :]
         else:
-            first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + (2 * tl.arange(0, pad_rope_dim // 2)[None, :])
-            first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + (2 * tl.arange(0, pad_rope_dim // 2)[None, :])
+            first_half_q_offsets = tl.arange(0, pad_n_qh)[:, None] * hd + (2 * tl.arange(0, rope_dim // 2)[None, :])
+            first_half_k_offsets = tl.arange(0, pad_n_kh)[:, None] * hd + (2 * tl.arange(0, rope_dim // 2)[None, :])
 
         first_q_mask = (tl.arange(0, pad_n_qh)[:, None] < n_qh) & (
-            tl.arange(0, pad_rope_dim // 2)[None, :] < (rope_dim // 2)
+            tl.arange(0, rope_dim // 2)[None, :] < (rope_dim // 2)
         )
         first_k_mask = (tl.arange(0, pad_n_kh)[:, None] < n_kh) & (
-            tl.arange(0, pad_rope_dim // 2)[None, :] < (rope_dim // 2)
+            tl.arange(0, rope_dim // 2)[None, :] < (rope_dim // 2)
         )
         q_tile_1 = tl.load(q_start_ptr + first_half_q_offsets, mask=first_q_mask, other=0).to(sin_row.dtype)
         k_tile_1 = tl.load(k_start_ptr + first_half_k_offsets, mask=first_k_mask, other=0).to(sin_row.dtype)
@@ -162,7 +161,6 @@ def _triton_rope_siso(
     hd: tl.constexpr,
     rope_dim: tl.constexpr,
     pad_n_h: tl.constexpr,
-    pad_rope_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     IS_NEOX_STYLE: tl.constexpr,
     USE_COS_SIN: tl.constexpr,
@@ -177,8 +175,8 @@ def _triton_rope_siso(
         # get the cos(mθ_{i...d/2}) and sin(mθ_{i...d/2}) for token position
         # m of this program instance
         # ####################################################################
-        cos_offsets = tl.arange(0, pad_rope_dim // 2)
-        sin_offsets = tl.arange(pad_rope_dim // 2, pad_rope_dim)
+        cos_offsets = tl.arange(0, rope_dim // 2)
+        sin_offsets = tl.arange(rope_dim // 2, rope_dim)
         cos_mask = cos_offsets < (rope_dim // 2)
         if USE_COS_SIN:
             pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
@@ -197,12 +195,12 @@ def _triton_rope_siso(
         # ####################################################################
         # left half of the head
         if IS_NEOX_STYLE:
-            first_half_offsets = tl.arange(0, pad_n_h)[:, None] * hd + tl.arange(0, pad_rope_dim // 2)[None, :]
+            first_half_offsets = tl.arange(0, pad_n_h)[:, None] * hd + tl.arange(0, rope_dim // 2)[None, :]
         else:
-            first_half_offsets = tl.arange(0, pad_n_h)[:, None] * hd + (2 * tl.arange(0, pad_rope_dim // 2)[None, :])
+            first_half_offsets = tl.arange(0, pad_n_h)[:, None] * hd + (2 * tl.arange(0, rope_dim // 2)[None, :])
 
         first_mask = (tl.arange(0, pad_n_h)[:, None] < n_h) & (
-            tl.arange(0, pad_rope_dim // 2)[None, :] < (rope_dim // 2)
+            tl.arange(0, rope_dim // 2)[None, :] < (rope_dim // 2)
         )
         qk_tile_1 = tl.load(qk_start_ptr + first_half_offsets, mask=first_mask, other=0).to(sin_row.dtype)
 
@@ -239,8 +237,6 @@ def rope_forward_triton(
 
     num_tokens, n_q_head, head_dim = q.shape
     n_kv_head = k.shape[1]
-    assert rope_dim <= head_dim
-    pad_rope_dim = triton.next_power_of_2(rope_dim)
     pad_n_q_head = triton.next_power_of_2(n_q_head)
     pad_n_kv_head = triton.next_power_of_2(n_kv_head)
     BLOCK_SIZE = max(pad_n_q_head, pad_n_kv_head)
@@ -249,6 +245,10 @@ def rope_forward_triton(
 
     if cos_sin_cache is not None and positions is not None:
         assert positions.shape[0] == num_tokens
+        assert rope_dim > 0, "rope_dim must be set when using cos_sin_cache"
+        assert rope_dim % 2 == 0, "rope_dim must be even"
+        assert rope_dim <= head_dim
+        assert cos_sin_cache.shape[-1] >= rope_dim
         _triton_rope[(n_row,)](
             q,
             q.stride(0),
@@ -268,7 +268,6 @@ def rope_forward_triton(
             rope_dim,
             pad_n_q_head,
             pad_n_kv_head,
-            pad_rope_dim,
             BLOCK_SIZE=BLOCK_SIZE,
             IS_NEOX_STYLE=is_neox_style,
             USE_COS_SIN=True,
@@ -300,7 +299,6 @@ def rope_forward_triton(
             rope_dim,
             pad_n_q_head,
             pad_n_kv_head,
-            pad_rope_dim,
             BLOCK_SIZE=BLOCK_SIZE,
             IS_NEOX_STYLE=is_neox_style,
             USE_COS_SIN=False,
@@ -328,8 +326,6 @@ def rope_forward_triton_siso(
         qk = qk.contiguous()
 
     num_tokens, n_head, head_dim = qk.shape
-    assert rope_dim <= head_dim
-    pad_rope_dim = triton.next_power_of_2(rope_dim)
     pad_n_head = triton.next_power_of_2(n_head)
     BLOCK_SIZE = pad_n_head
     num_vectorcore = get_vectorcore_num()
@@ -352,7 +348,6 @@ def rope_forward_triton_siso(
             head_dim,
             rope_dim,
             pad_n_head,
-            pad_rope_dim,
             BLOCK_SIZE=BLOCK_SIZE,
             IS_NEOX_STYLE=is_neox_style,
             USE_COS_SIN=True,
@@ -380,7 +375,6 @@ def rope_forward_triton_siso(
             head_dim,
             rope_dim,
             pad_n_head,
-            pad_rope_dim,
             BLOCK_SIZE=BLOCK_SIZE,
             IS_NEOX_STYLE=is_neox_style,
             USE_COS_SIN=False,
