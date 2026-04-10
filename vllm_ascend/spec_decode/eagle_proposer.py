@@ -2593,7 +2593,6 @@ def _multi_layer_eagle_shift_and_cache(
         cached_len_ptr=cached_lens,
         store_start_ptr=store_start,
         store_lens_ptr=store_lens,
-        MAX_SHIFT=max_shift,
         PADDED_SHIFT=pad_shift,
         HIDDEN_SIZE=hidden_size,
     )
