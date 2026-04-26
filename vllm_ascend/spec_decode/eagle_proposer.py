@@ -25,7 +25,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
-from vllm.triton_utils import HAS_TRITON, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -48,6 +48,9 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled, vllm_version_is
+
+BLOCK_HIDDEN = 64
+BLOCK_TOKENS = 64
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
@@ -1720,6 +1723,7 @@ class MultiLayerEagleProposer(SpecDecodeBaseProposer):
             cached_prev_positions=multi_layer_eagle_metadata.cached_positions,
             cached_prev_hidden_states=multi_layer_eagle_metadata.cached_hidden_states,
             cached_slot_mappings=multi_layer_eagle_metadata.cached_slot_mappings,
+            common_attn_metadata=common_attn_metadata,
         )
 
         return prev_token_ids, prev_positions, prev_hidden_states, common_attn_metadata
@@ -2514,6 +2518,7 @@ def _multi_layer_eagle_shift_and_cache(
     cached_prev_positions: torch.Tensor,
     cached_prev_hidden_states: torch.Tensor,
     cached_slot_mappings: torch.Tensor,
+    common_attn_metadata: CommonAttentionMetadata,
 ):
     if batch_size == 0:
         return
@@ -2540,216 +2545,224 @@ def _multi_layer_eagle_shift_and_cache(
         max=max_shift,
     )
 
-    pad_shift = max(1, 2 ** (math.ceil(math.log2(max_shift)) if max_shift > 1 else 0))
+    # Triton kernel path: parallelized shift+gather
+    num_reqs = start_token_indices.shape[0]
+    max_window_len = int(
+        (
+            common_attn_metadata.query_start_loc_cpu[1:]
+            - common_attn_metadata.query_start_loc_cpu[:-1]
+        )
+        .max()
+        .item()
+    )
+    num_blocks = max(1, (max_window_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS)
 
-    _shift_and_gather_cache_1d_kernel(
-        src_ptr=src_token_ids,
-        dst_ptr=dst_token_ids,
-        cached_ptr=cached_prev_token_ids,
-        start_ptr=start_token_indices,
-        end_ptr=end_token_indices,
-        shift_ptr=shift,
-        cached_len_ptr=cached_lens,
-        store_start_ptr=store_start,
-        store_lens_ptr=store_lens,
-        PADDED_SHIFT=pad_shift,
+    _shift_and_gather_cache_1d_kernel[(num_reqs, num_blocks)](
+        src_token_ids,
+        dst_token_ids,
+        cached_prev_token_ids,
+        start_token_indices,
+        end_token_indices,
+        shift,
+        cached_lens,
+        store_start,
+        store_lens,
+        MAX_SHIFT=max_shift,
+        PADDED_SHIFT=triton.next_power_of_2(max_shift),
+        BLOCK_TOKENS=BLOCK_TOKENS,
     )
 
-    _shift_and_gather_cache_1d_kernel(
-        src_ptr=src_slot_mapping,
-        dst_ptr=dst_slot_mapping,
-        cached_ptr=cached_slot_mappings,
-        start_ptr=start_token_indices,
-        end_ptr=end_token_indices,
-        shift_ptr=shift,
-        cached_len_ptr=cached_lens,
-        store_start_ptr=store_start,
-        store_lens_ptr=store_lens,
-        PADDED_SHIFT=pad_shift,
+    _shift_and_gather_cache_1d_kernel[(num_reqs, num_blocks)](
+        src_slot_mapping,
+        dst_slot_mapping,
+        cached_slot_mappings,
+        start_token_indices,
+        end_token_indices,
+        shift,
+        cached_lens,
+        store_start,
+        store_lens,
+        MAX_SHIFT=max_shift,
+        PADDED_SHIFT=triton.next_power_of_2(max_shift),
+        BLOCK_TOKENS=BLOCK_TOKENS,
     )
-    
-    _shift_and_gather_cache_1d_kernel(
-        src_ptr=src_positions,
-        dst_ptr=dst_positions,
-        cached_ptr=cached_prev_positions,
-        start_ptr=start_token_indices,
-        end_ptr=end_token_indices,
-        shift_ptr=shift,
-        cached_len_ptr=cached_lens,
-        store_start_ptr=store_start,
-        store_lens_ptr=store_lens,
-        PADDED_SHIFT=pad_shift,
+
+    _shift_and_gather_cache_1d_kernel[(num_reqs, num_blocks)](
+        src_positions,
+        dst_positions,
+        cached_prev_positions,
+        start_token_indices,
+        end_token_indices,
+        shift,
+        cached_lens,
+        store_start,
+        store_lens,
+        MAX_SHIFT=max_shift,
+        PADDED_SHIFT=triton.next_power_of_2(max_shift),
+        BLOCK_TOKENS=BLOCK_TOKENS,
     )
 
     hidden_size = int(dst_hidden_states.shape[1])
+    num_hidden_blocks = max(1, (hidden_size + BLOCK_HIDDEN - 1) // BLOCK_HIDDEN)
 
-    _shift_and_gather_hidden_kernel(
-        src_ptr=src_hidden_states,
-        dst_ptr=dst_hidden_states,
-        cached_ptr=cached_prev_hidden_states,
-        start_ptr=start_token_indices,
-        end_ptr=end_token_indices,
-        shift_ptr=shift,
-        cached_len_ptr=cached_lens,
-        store_start_ptr=store_start,
-        store_lens_ptr=store_lens,
-        PADDED_SHIFT=pad_shift,
+    _shift_and_gather_hidden_kernel[(num_reqs, num_blocks, num_hidden_blocks)](
+        src_hidden_states,
+        dst_hidden_states,
+        cached_prev_hidden_states,
+        start_token_indices,
+        end_token_indices,
+        shift,
+        cached_lens,
+        store_start,
+        store_lens,
+        MAX_SHIFT=max_shift,
+        PADDED_SHIFT=triton.next_power_of_2(max_shift),
         HIDDEN_SIZE=hidden_size,
+        BLOCK_TOKENS=BLOCK_TOKENS,
+        BLOCK_HIDDEN=BLOCK_HIDDEN,
+        num_warps=4,
     )
 
     cached_lens.copy_(store_lens)
     return
 
 
+@triton.jit
 def _shift_and_gather_cache_1d_kernel(
-    src_ptr: torch.Tensor,
-    dst_ptr: torch.Tensor,
-    cached_ptr: torch.Tensor,
-    start_ptr: torch.Tensor,
-    end_ptr: torch.Tensor,
-    shift_ptr: torch.Tensor,
-    cached_len_ptr: torch.Tensor,
-    store_start_ptr: torch.Tensor,
-    store_lens_ptr: torch.Tensor,
-    PADDED_SHIFT: int,
+    src_ptr,
+    dst_ptr,
+    cached_ptr,
+    start_ptr,
+    end_ptr,
+    shift_ptr,
+    cached_len_ptr,
+    store_start_ptr,
+    store_len_ptr,
+    MAX_SHIFT: tl.constexpr,
+    PADDED_SHIFT: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
 ):
-    batch_size = start_ptr.shape[0]
+    pid_seq = tl.program_id(0)
+    pid_blk = tl.program_id(1)
 
-    for pid_seq in range(batch_size):
-        start = int(start_ptr[pid_seq].item())
-        end = int(end_ptr[pid_seq].item())
-        shift_val = int(shift_ptr[pid_seq].item())
-        cached_len_val = int(cached_len_ptr[pid_seq].item())
-        store_start_val = int(store_start_ptr[pid_seq].item())
-        store_len_val = int(store_lens_ptr[pid_seq].item())
+    start = tl.load(start_ptr + pid_seq).to(tl.int32)
+    end = tl.load(end_ptr + pid_seq).to(tl.int32)
+    shift = tl.load(shift_ptr + pid_seq).to(tl.int32)
+    cached_len = tl.load(cached_len_ptr + pid_seq).to(tl.int32)
 
-        assert cached_len_val >= shift_val, "Cached length must be >= shift"
+    assert cached_len >= shift
 
-        window_len = end - start + 1
+    # get dst indices
+    base = pid_blk * BLOCK_TOKENS
+    k = tl.arange(0, BLOCK_TOKENS)
+    offs = base + k
+    dst_idx = start + offs
 
-        result_parts = []
+    # get dst mask
+    window_len = end - start + 1
+    mask = offs < window_len
 
-        if shift_val > 0:
-            cached_start_idx = cached_len_val - shift_val
-            take_from_cache = min(shift_val, cached_ptr.shape[1] - cached_start_idx, cached_len_val - cached_start_idx)
-            if take_from_cache > 0:
-                cached_slice = cached_ptr[pid_seq, cached_start_idx : cached_start_idx + take_from_cache]
-                result_parts.append(cached_slice)
-            if take_from_cache < shift_val:
-                pad = torch.zeros(shift_val - take_from_cache, dtype=src_ptr.dtype, device=src_ptr.device)
-                result_parts.append(pad)
-        else:
-            # shift_val == 0, no prefix
-            pass
+    # load from cached
+    base_cached = cached_ptr + pid_seq * MAX_SHIFT
+    cached_idx = cached_len - shift + offs
+    cached_mask = offs < shift
+    safe_cached_idx = tl.where(cached_mask, cached_idx, 0)
+    val_cached = tl.load(base_cached + safe_cached_idx, mask=mask & cached_mask, other=0)
 
-        need_from_src = window_len - shift_val
-        if need_from_src > 0:
-            src_end_idx = end + 1
-            src_slice = src_ptr[start : src_end_idx]
-            actual_take = min(need_from_src, src_slice.shape[0])
-            if actual_take > 0:
-                result_parts.append(src_slice[:actual_take])
-            if actual_take < need_from_src:
-                pad = torch.zeros(need_from_src - actual_take, dtype=src_ptr.dtype, device=src_ptr.device)
-                result_parts.append(pad)
+    # load from src
+    src_idx = start + offs - shift
+    safe_src_idx = tl.where(src_idx >= 0, src_idx, 0)
+    val_src = tl.load(src_ptr + safe_src_idx, mask=mask & ~cached_mask, other=0)
 
-        if result_parts:
-            result = torch.cat(result_parts)
-            if result.numel() < window_len:
-                result = torch.nn.functional.pad(result, (0, window_len - result.numel()), value=0)
-            elif result.numel() > window_len:
-                result = result[:window_len]
-        else:
-            result = torch.zeros(window_len, dtype=src_ptr.dtype, device=src_ptr.device)
+    # store to dst
+    val = tl.where(cached_mask, val_cached, val_src)
+    tl.store(dst_ptr + dst_idx, val, mask=mask)
 
-        dst_ptr[start : start + window_len] = result
-
-        cached_view = cached_ptr[pid_seq, :PADDED_SHIFT] 
-
-        if store_len_val > 0 and store_start_val < dst_ptr.shape[0]:
-            actual_store_len = min(store_len_val, dst_ptr.shape[0] - store_start_val)
-            cache_data = dst_ptr[store_start_val : store_start_val + actual_store_len]
-
-            cached_view[:] = 0
-            copy_len = min(cache_data.shape[0], PADDED_SHIFT)
-            cached_view[:copy_len] = cache_data[:copy_len]
-        else:
-            cached_view.zero_()
+    # Store into the per-sequence cache.
+    store_start = tl.load(store_start_ptr + pid_seq).to(tl.int32)
+    store_len = tl.load(store_len_ptr + pid_seq).to(tl.int32)
+    m = tl.arange(0, PADDED_SHIFT)
+    store_mask = m < MAX_SHIFT
+    dst_idx = store_start + m
+    safe_dst_idx = tl.where(store_mask & (m < store_len), dst_idx, 0)
+    safe_m = tl.where(store_mask, m, 0)
+    val = tl.load(dst_ptr + safe_dst_idx, mask=store_mask & (m < store_len), other=0)
+    tl.store(base_cached + safe_m, val, mask=store_mask)
 
 
+@triton.jit
 def _shift_and_gather_hidden_kernel(
-    src_ptr: torch.Tensor,
-    dst_ptr: torch.Tensor,
-    cached_ptr: torch.Tensor,
-    start_ptr: torch.Tensor,
-    end_ptr: torch.Tensor,
-    shift_ptr: torch.Tensor,
-    cached_len_ptr: torch.Tensor,
-    store_start_ptr: torch.Tensor,
-    store_lens_ptr: torch.Tensor,
-    PADDED_SHIFT: int,
-    HIDDEN_SIZE: int,
+    src_ptr,
+    dst_ptr,
+    cached_ptr,
+    start_ptr,
+    end_ptr,
+    shift_ptr,
+    cached_len_ptr,
+    store_start_ptr,
+    store_len_ptr,
+    MAX_SHIFT: tl.constexpr,
+    PADDED_SHIFT: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_HIDDEN: tl.constexpr,
 ):
-    batch_size = start_ptr.shape[0]
+    pid_seq = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+    pid_hid = tl.program_id(2)
 
-    for pid_seq in range(batch_size):
-        start = int(start_ptr[pid_seq].item())
-        end = int(end_ptr[pid_seq].item())
-        shift_val = int(shift_ptr[pid_seq].item())
-        cached_len_val = int(cached_len_ptr[pid_seq].item())
-        store_start_val = int(store_start_ptr[pid_seq].item())
-        store_len_val = int(store_lens_ptr[pid_seq].item())
+    start = tl.load(start_ptr + pid_seq).to(tl.int32)
+    end = tl.load(end_ptr + pid_seq).to(tl.int32)
+    shift = tl.load(shift_ptr + pid_seq).to(tl.int32)
+    cached_len = tl.load(cached_len_ptr + pid_seq).to(tl.int32)
 
-        assert cached_len_val >= shift_val, "Cached length must be >= shift"
-        window_len = end - start + 1
+    assert cached_len >= shift
 
-        result_parts = []
+    # get dst indices
+    base = pid_blk * BLOCK_TOKENS
+    k = tl.arange(0, BLOCK_TOKENS)
+    tok_offs = base + k
+    dst_tok = start + tok_offs
+    n = pid_hid * BLOCK_HIDDEN + tl.arange(0, BLOCK_HIDDEN)
+    dst_ptrs = dst_ptr + dst_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
 
-        if shift_val > 0:
-            cached_start_idx = cached_len_val - shift_val
-            take_from_cache = min(shift_val, cached_ptr.shape[1] - cached_start_idx)
-            if take_from_cache > 0:
-                cached_slice = cached_ptr[pid_seq, cached_start_idx : cached_start_idx + take_from_cache, :]
-                result_parts.append(cached_slice)
-            if take_from_cache < shift_val:
-                pad = torch.zeros(shift_val - take_from_cache, HIDDEN_SIZE, dtype=src_ptr.dtype, device=src_ptr.device)
-                result_parts.append(pad)
+    # get dst mask
+    window_len = end - start + 1
+    tok_mask = tok_offs < window_len
+    n_mask = n < HIDDEN_SIZE
+    mask = tok_mask[:, None] & n_mask[None, :]
 
-        need_from_src = window_len - shift_val
-        if need_from_src > 0:
-            src_end_idx = end + 1
-            src_slice = src_ptr[start : src_end_idx, :]
-            actual_take = min(need_from_src, src_slice.shape[0])
-            if actual_take > 0:
-                result_parts.append(src_slice[:actual_take, :])
-            if actual_take < need_from_src:
-                pad = torch.zeros(need_from_src - actual_take, HIDDEN_SIZE, dtype=src_ptr.dtype, device=src_ptr.device)
-                result_parts.append(pad)
+    # load from cached
+    base_cached = cached_ptr + pid_seq * HIDDEN_SIZE * MAX_SHIFT
+    cached_tok = cached_len - shift + tok_offs
+    safe_cached_tok = tl.where(tok_offs < shift, cached_tok, 0)
+    cached_ptrs = base_cached + safe_cached_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
+    cached_mask = tok_offs < shift
+    val_cached = tl.load(cached_ptrs, mask=mask & cached_mask[:, None], other=0)
 
-        if result_parts:
-            result = torch.cat(result_parts, dim=0)
-            if result.shape[0] < window_len:
-                pad = torch.zeros(window_len - result.shape[0], HIDDEN_SIZE, dtype=src_ptr.dtype, device=src_ptr.device)
-                result = torch.cat([result, pad], dim=0)
-            elif result.shape[0] > window_len:
-                result = result[:window_len, :]
-        else:
-            result = torch.zeros(window_len, HIDDEN_SIZE, dtype=src_ptr.dtype, device=src_ptr.device)
+    # load from src
+    src_tok = start + tok_offs - shift
+    safe_src_tok = tl.where(src_tok >= 0, src_tok, 0)
+    src_ptrs = src_ptr + safe_src_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
+    val_src = tl.load(src_ptrs, mask=mask & ~cached_mask[:, None], other=0)
 
-        dst_ptr[start : start + window_len, :] = result
+    # store to dst
+    val = tl.where(cached_mask[:, None], val_cached, val_src)
+    tl.store(dst_ptrs, val, mask=mask)
 
-        cached_view = cached_ptr[pid_seq, :PADDED_SHIFT, :] # 形状 [PADDED_SHIFT, HIDDEN_SIZE]
-
-        if store_len_val > 0 and store_start_val < dst_ptr.shape[0]:
-            actual_store_len = min(store_len_val, dst_ptr.shape[0] - store_start_val)
-            cache_data = dst_ptr[store_start_val : store_start_val + actual_store_len, :]
-
-            cached_view[:] = 0
-            copy_len = min(cache_data.shape[0], PADDED_SHIFT)
-            cached_view[:copy_len, :] = cache_data[:copy_len, :]
-        else:
-            cached_view.zero_()
-
+    # store to cached
+    store_start = tl.load(store_start_ptr + pid_seq).to(tl.int32)
+    store_len = tl.load(store_len_ptr + pid_seq).to(tl.int32)
+    m = tl.arange(0, PADDED_SHIFT)
+    m_mask = (m < MAX_SHIFT) & (m < store_len)
+    store_tok = store_start + m
+    safe_store_tok = tl.where(m_mask, store_tok, 0)
+    safe_m = tl.where(m < MAX_SHIFT, m, 0)
+    dst_ptrs = dst_ptr + safe_store_tok[:, None] * HIDDEN_SIZE + n[None, :] * 1
+    store_ptrs = base_cached + safe_m[:, None] * HIDDEN_SIZE + n[None, :] * 1
+    mask = m_mask[:, None] & n_mask[None, :]
+    val = tl.load(dst_ptrs, mask=mask, other=0)
+    tl.store(store_ptrs, val, mask=mask)
 
 
 class AscendMultiLayerEagleProposer(MultiLayerEagleProposer):
