@@ -334,8 +334,12 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, output: torch.Tensor, hidden_states: torch.Tensor):
-        qkv, _ = self.qkv_proj(hidden_states)
-        if "qwen3_5" in self.config.model_type:
+        # qkv, _ = self.qkv_proj(hidden_states)
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+        # if "qwen3_5" in self.config.model_type:
+        if False:
             cos_sin = self.rotary_emb.cos_sin_cache[positions]
             if cos_sin.device != qkv.device:
                 cos_sin = cos_sin.to(qkv.device)
@@ -358,21 +362,27 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
             )
         else:
             if self.attn_output_gate:
-                q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+                # q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+                q_gate = q
                 orig_shape = q_gate.shape[:-1]
                 q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
                 q, gate = torch.chunk(q_gate, 2, dim=-1)
                 q = q.reshape(*orig_shape, -1)
                 gate = gate.reshape(*orig_shape, -1)
             else:
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                pass
 
-            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(-1, self.num_heads * self.head_dim)
-            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(-1, self.num_kv_heads * self.head_dim)
-
+            # q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(-1, self.num_heads * self.head_dim)
+            # k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(-1, self.num_kv_heads * self.head_dim)
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).unsqueeze(0).transpose(1, 2)
             q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
+        q = q.transpose(1, 2).reshape(-1, self.num_heads * self.head_dim).contiguous()
+        k = k.transpose(1, 2).reshape(-1, self.num_kv_heads * self.head_dim).contiguous()
+
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
