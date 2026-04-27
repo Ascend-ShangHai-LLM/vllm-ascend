@@ -328,6 +328,7 @@ def unquant_apply_mlp(
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
 ) -> torch.Tensor:
+    need_trans=True
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)

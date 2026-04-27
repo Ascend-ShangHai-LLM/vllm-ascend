@@ -115,6 +115,9 @@ class NPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        
+        self.local_dp_rank = self.vllm_config.parallel_config.data_parallel_rank_local
+        self.global_rank = self.local_dp_rank * self.vllm_config.parallel_config.world_size + self.local_rank
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
@@ -214,26 +217,26 @@ class NPUWorker(WorkerBase):
         allocator = CaMemAllocator.get_instance()
         allocator.wake_up(tags=tags)
 
-        hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
+        # hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
         model = self.model_runner.model
-        if tags is None or "weights" in tags:
-            for name, param in model.named_parameters():
-                if "w2_weight" in name and param.shape[2] == hidden_size:
-                    parts = name.split(".")
-                    param_name = parts[-1]
-                    parent_module = model.get_submodule(".".join(parts[:-1]))
+        # if tags is None or "weights" in tags:
+        #     for name, param in model.named_parameters():
+        #         if "w2_weight" in name and param.shape[2] == hidden_size:
+        #             parts = name.split(".")
+        #             param_name = parts[-1]
+        #             parent_module = model.get_submodule(".".join(parts[:-1]))
 
-                    w2_data = param.transpose(1, 2)
-                    w2_data = torch.nn.Parameter(w2_data, requires_grad=False)
-                    setattr(parent_module, param_name, w2_data)
-                elif "w13_weight" in name and param.shape[1] == hidden_size:
-                    parts = name.split(".")
-                    param_name = parts[-1]
-                    parent_module = model.get_submodule(".".join(parts[:-1]))
+        #             w2_data = param.transpose(1, 2)
+        #             w2_data = torch.nn.Parameter(w2_data, requires_grad=False)
+        #             setattr(parent_module, param_name, w2_data)
+        #         elif "w13_weight" in name and param.shape[1] == hidden_size:
+        #             parts = name.split(".")
+        #             param_name = parts[-1]
+        #             parent_module = model.get_submodule(".".join(parts[:-1]))
 
-                    w13_data = param.transpose(1, 2)
-                    w13_data = torch.nn.Parameter(w13_data, requires_grad=False)
-                    setattr(parent_module, param_name, w13_data)
+        #             w13_data = param.transpose(1, 2)
+        #             w13_data = torch.nn.Parameter(w13_data, requires_grad=False)
+        #             setattr(parent_module, param_name, w13_data)
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):

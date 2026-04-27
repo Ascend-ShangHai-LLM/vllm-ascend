@@ -75,11 +75,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
 
-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
-        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+        # w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+        # layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
 
-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
-        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+        # w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+        # layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
 
         # TODO: Current dispatch_ffn_combine fusion operator ONLY supports NZ format.
         # Therefore, we must cast weights to NZ when fusion is enabled.
@@ -87,12 +87,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # ND format (or other formats), remove this specific 'if' check and the forced
         # npu_format_cast. At that point, the operator should be able to handle weights
         # in their native format without explicit casting here.
-        if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2:
-            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
-            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-        else:
-            layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
-            layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+        # if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2:
+        #     layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        #     layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        # else:
+        #     layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+        #     layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
 
     def apply(
         self,
