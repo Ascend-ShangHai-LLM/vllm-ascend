@@ -578,6 +578,10 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
+        import os
+        custom_worker_url = os.getenv("CUSTOM_WORKER_URL", None)
+        if custom_worker_url is not None:
+            self.distributed_init_method = custom_worker_url
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
         )
