@@ -64,7 +64,7 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             prefix=prefix,
         )
 
-        self.enable_pad = self.head_size > MIN_PAD_SIZE and self.head_size < MAX_PAD_SIZE
+        # self.enable_pad = self.head_size > MIN_PAD_SIZE and self.head_size < MAX_PAD_SIZE
         self.scale_value = self.head_size**-0.5
 
     @classmethod
@@ -130,50 +130,70 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor | None = None,
     ):
-        bsz, q_len = query.size()[:2]
-        kv_len = key.size(1)
-        is_reshaped = query.dim() == 4
+        # bsz, q_len = query.size()[:2]
+        # kv_len = key.size(1)
+        # is_reshaped = query.dim() == 4
 
-        if sequence_lengths is not None:
-            # Use pre-compute seq_lens before vision blocks.
-            if sequence_lengths.device.type != "cpu":
-                sequence_lengths = sequence_lengths.to("cpu")
-            seq_lens_cpu = sequence_lengths
-        else:
-            # Convert cu_seqlens to seq_lens and move it to CPU, since FA requires CPU seq_lens.
-            # NOTE: This will considerably hurt performance.
-            cu_seqlens = self._maybe_compute_cu_seqlens(bsz, q_len, cu_seqlens)
-            seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
+        # if sequence_lengths is not None:
+        #     # Use pre-compute seq_lens before vision blocks.
+        #     if sequence_lengths.device.type != "cpu":
+        #         sequence_lengths = sequence_lengths.to("cpu")
+        #     seq_lens_cpu = sequence_lengths
+        # else:
+        #     # Convert cu_seqlens to seq_lens and move it to CPU, since FA requires CPU seq_lens.
+        #     # NOTE: This will considerably hurt performance.
+        #     cu_seqlens = self._maybe_compute_cu_seqlens(bsz, q_len, cu_seqlens)
+        #     seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
 
-        # q, k, v: [b, s, head, head_dim] -> [b * s, head, head_dim]
-        q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
+        # # q, k, v: [b, s, head, head_dim] -> [b * s, head, head_dim]
+        # q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
 
-        if self.enable_pad:
-            origin_shape = q.shape[-1]
-            pad_len = MAX_PAD_SIZE - origin_shape
-            # [b * s, head, head_dim] -> [b * s, head, MAX_PAD_SIZE]
-            q = F.pad(q, (0, pad_len), mode="constant", value=0)
-            k = F.pad(k, (0, pad_len), mode="constant", value=0)
-            v = F.pad(v, (0, pad_len), mode="constant", value=0)
+        # if self.enable_pad:
+        #     origin_shape = q.shape[-1]
+        #     pad_len = MAX_PAD_SIZE - origin_shape
+        #     # [b * s, head, head_dim] -> [b * s, head, MAX_PAD_SIZE]
+        #     q = F.pad(q, (0, pad_len), mode="constant", value=0)
+        #     k = F.pad(k, (0, pad_len), mode="constant", value=0)
+        #     v = F.pad(v, (0, pad_len), mode="constant", value=0)
 
-        seq_lens_cpu = list(seq_lens_cpu.cumsum(0))
+        # seq_lens_cpu = list(seq_lens_cpu.cumsum(0))
 
+        # context_layer = torch_npu.npu_fusion_attention(
+        #     query=q,
+        #     key=k,
+        #     value=v,
+        #     actual_seq_qlen=seq_lens_cpu,
+        #     actual_seq_kvlen=seq_lens_cpu,
+        #     head_num=self.num_heads,
+        #     scale=self.scale_value,
+        #     input_layout="TND",
+        # )[0]
+
+        # if self.enable_pad:
+        #     context_layer = context_layer[..., :origin_shape]
+
+        # if is_reshaped:
+        #     context_layer = einops.rearrange(context_layer, "(b s) h d -> b s h d", b=bsz).contiguous()
+        # else:
+        #     context_layer = einops.rearrange(context_layer, "(b s) h d -> b s (h d)", b=bsz).contiguous()
+        # return context_layer
+        q, k, v = query, key, value
+        assert q.size(0) == 1, "Only support batch size 1 for flash attention"
+        q = q.transpose(1, 2).squeeze(0)  # [seq, head, dim]
+        k = k.transpose(1, 2).squeeze(0)
+        v = v.transpose(1, 2).squeeze(0)
+        
         context_layer = torch_npu.npu_fusion_attention(
-            query=q,
-            key=k,
-            value=v,
-            actual_seq_qlen=seq_lens_cpu,
-            actual_seq_kvlen=seq_lens_cpu,
-            head_num=self.num_heads,
-            scale=self.scale_value,
+            q,
+            k,
+            v,
+            q.shape[1],
+            pse=None,
+            atten_mask=None,
+            scale=q.shape[-1] ** -0.5,
+            keep_prob=1.0,
             input_layout="TND",
+            actual_seq_qlen=tuple(cu_seqlens[1:].tolist()),
+            actual_seq_kvlen=tuple(cu_seqlens[1:].tolist()),
         )[0]
-
-        if self.enable_pad:
-            context_layer = context_layer[..., :origin_shape]
-
-        if is_reshaped:
-            context_layer = einops.rearrange(context_layer, "(b s) h d -> b s h d", b=bsz).contiguous()
-        else:
-            context_layer = einops.rearrange(context_layer, "(b s) h d -> b s (h d)", b=bsz).contiguous()
         return context_layer
