@@ -1597,6 +1597,7 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            entropy=sampler_output.entropy,
         )
 
         if self.dynamic_eplb:
