@@ -1938,6 +1938,7 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            entropy=sampler_output.entropy,
         )
         if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, '_execution_start_time'):
             self._sync_device()

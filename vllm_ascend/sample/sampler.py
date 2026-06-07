@@ -1,3 +1,5 @@
+import os
+
 import torch
 import vllm.envs as envs
 from vllm.triton_utils import HAS_TRITON
@@ -10,6 +12,15 @@ from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
 
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
+
+
+def compute_entropy(probs: torch.Tensor) -> torch.Tensor:
+    logprobs = torch.log2(probs)
+    return (-torch.nansum(probs * logprobs, dim=-1)).cpu()
+
+
+def is_precision_monitor_enabled() -> bool:
+    return os.getenv("VLLM_PRECISION_MONITOR", "0") == "1"
 
 
 def random_sample(
@@ -102,7 +113,10 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         # when batch_invariant mode is enabled, we should use vllm's implementation.
         # or it will make batch_invariant mode not working.
         if envs.VLLM_BATCH_INVARIANT:
-            return super().forward_native(logits, generators, k, p)
+            sampled, logits_to_return = super().forward_native(
+                logits, generators, k, p
+            )
+            return sampled, logits_to_return, None
         logits = self.apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
@@ -111,11 +125,16 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
 
         probs = logits.softmax(dim=-1, dtype=torch.float32)
+        entropy = compute_entropy(probs) if is_precision_monitor_enabled() else None
         if get_ascend_config().enable_async_exponential:
             # Add synchronize to prevent synchronize error.
             self.async_event.synchronize()
-            return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
-        return random_sample(probs, generators), logits_to_return
+            return (
+                probs.div_(self.q).argmax(dim=-1).view(-1),
+                logits_to_return,
+                entropy,
+            )
+        return random_sample(probs, generators), logits_to_return, entropy
 
 
 def _apply_top_k_top_p_pytorch(

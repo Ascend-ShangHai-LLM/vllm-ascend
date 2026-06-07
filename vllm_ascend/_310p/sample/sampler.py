@@ -22,6 +22,8 @@ from vllm_ascend.sample.sampler import (
     DEFAULT_LOGPROBS_MODE,
     AscendSampler,
     AscendTopKTopPSampler,
+    compute_entropy,
+    is_precision_monitor_enabled,
 )
 from vllm_ascend.utils import global_stream, npu_stream_switch
 
@@ -70,7 +72,8 @@ class AscendTopKTopPSampler310(AscendTopKTopPSampler):
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
 
         probs = logits.softmax(dim=-1, dtype=torch.float32)
-        return _random_sample_310p(probs, generators), logits_to_return
+        entropy = compute_entropy(probs) if is_precision_monitor_enabled() else None
+        return _random_sample_310p(probs, generators), logits_to_return, entropy
 
 
 class AscendSampler310(AscendSampler):
