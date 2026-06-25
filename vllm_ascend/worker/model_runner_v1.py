@@ -224,6 +224,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    start_time: float | None
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -1451,6 +1452,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        start_time = time.time()
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -1793,6 +1795,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                start_time=start_time,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -1841,6 +1844,7 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            start_time
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -1928,6 +1932,10 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 logger.warning("RoutedExpertsCapturer is not initialized.")
 
+        duration = time.time() - start_time
+        monitor_stats = scheduler_output.monitor_stats
+        monitor_stats.append(duration)
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -1938,6 +1946,7 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            monitor_stats=monitor_stats,
             entropy=sampler_output.entropy,
         )
         if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, '_execution_start_time'):
