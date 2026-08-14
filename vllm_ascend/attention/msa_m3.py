@@ -51,11 +51,8 @@ from vllm_ascend.attention.msa_m3_triton import (
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
-from vllm_ascend.attention.msa_m3_npu import (
-    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc_legacy,
-)
 from vllm_ascend.attention.msa_m3_npu_new import (
-    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc_pp8,
+    minimax_m3_sparse_attn as minimax_m3_sparse_attn_ascendc_prefill,
     minimax_m3_sparse_attn_decode as minimax_m3_sparse_attn_decode_ascendc,
 )
 from vllm_ascend.attention.msa_m3_ops import (
@@ -70,10 +67,9 @@ from vllm_ascend.ops.linear_op import get_parallel_op
 
 logger = init_logger(__name__)
 
-_SPARSE_ATTN_NEW_OP_PP_SIZE = 8
+_SPARSE_ATTN_PREFILL_KV_CACHE_DTYPE = "bfloat16"
 
 _SPARSE_ATTN_LOGGED = False
-FP8_E4M3_MAX = 448.0
 _INDEX_LOCAL_CP_QUERY_TILE_SIZE = 128
 
 
@@ -190,6 +186,61 @@ def _active_prefill_num_reqs(
     if active > 0:
         return active
     return min(1, num_prefills)
+
+
+def _resolve_main_kv_cache_dtype(
+    vllm_config: VllmConfig,
+    cache_config: CacheConfig | None,
+) -> str:
+    """Use BF16 because every prefill runs the BF16-only CSR sparse op."""
+    del vllm_config, cache_config
+    return _SPARSE_ATTN_PREFILL_KV_CACHE_DTYPE
+
+
+def _prepare_main_kv_cache_update(
+    tensor: torch.Tensor,
+    cache: torch.Tensor,
+) -> torch.Tensor:
+    return tensor.to(dtype=cache.dtype)
+
+
+def _get_seq_lens_cpu(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> torch.Tensor:
+    seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        raise RuntimeError(
+            "MiniMax M3 sparse attention requires CPU sequence lengths to "
+            "build K2Q metadata without a device-to-host synchronization"
+        )
+    if seq_lens_cpu.device.type != "cpu":
+        raise RuntimeError("MiniMax M3 CPU sequence lengths must be on CPU")
+    return seq_lens_cpu
+
+
+def _build_k2q_block_metadata(
+    seq_lens_cpu: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, int, int]:
+    """Build K2Q block metadata on CPU before entering the NPU hot path."""
+    block_lens_cpu = torch.div(
+        seq_lens_cpu.to(torch.int32) + block_size - 1,
+        block_size,
+        rounding_mode="floor",
+    )
+    cu_block_lens_cpu = torch.empty(
+        block_lens_cpu.numel() + 1,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    cu_block_lens_cpu[0] = 0
+    torch.cumsum(block_lens_cpu, dim=0, out=cu_block_lens_cpu[1:])
+    block_lens = block_lens_cpu.tolist()
+    total_rows = sum(block_lens)
+    max_kv = max(block_lens, default=0)
+    return cu_block_lens_cpu, total_rows, max_kv
 
 
 def _build_local_cp_query_tile_layout(
@@ -863,6 +914,10 @@ class AscendMiniMaxM3SparseBackend(AttentionBackend):
 class AscendMiniMaxM3SparsePrefillMetadata:
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
+    cu_block_lens: torch.Tensor
+    k2q_total_rows: int
+    k2q_max_kv: int
+    block_size: int
     seq_lens: torch.Tensor
     actual_seq_lengths: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
@@ -911,6 +966,7 @@ class AscendMiniMaxM3SparseMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self.block_size = kv_cache_spec.block_size
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
@@ -940,11 +996,13 @@ class AscendMiniMaxM3SparseMetadataBuilder(
         prefill_metadata: AscendMiniMaxM3SparsePrefillMetadata | None = None
         active_prefills = 0
         if num_prefills > 0:
+            seq_lens_cpu = _get_seq_lens_cpu(common_attn_metadata)
             active_prefills = _active_prefill_num_reqs(
                 num_prefills, num_prefill_tokens, qsl_cpu, num_decodes
             )
             prefill_end = num_decodes + active_prefills
             prefill_kv_lens = seq_lens[num_decodes:prefill_end]
+            prefill_kv_lens_cpu = seq_lens_cpu[num_decodes:prefill_end]
             prefill_cu_seqlens_q = (
                 query_start_loc[num_decodes : prefill_end + 1] - num_decode_tokens
             ).to(torch.int32)
@@ -953,6 +1011,18 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             )
             prefill_cu_seqlens_k[0] = 0
             torch.cumsum(prefill_kv_lens, dim=0, out=prefill_cu_seqlens_k[1:])
+            (
+                prefill_cu_block_lens_cpu,
+                k2q_total_rows,
+                k2q_max_kv,
+            ) = _build_k2q_block_metadata(
+                prefill_kv_lens_cpu,
+                self.block_size,
+            )
+            prefill_cu_block_lens = prefill_cu_block_lens_cpu.to(
+                device=seq_lens.device,
+                non_blocking=True,
+            )
             prefill_query_lens_cpu = (
                 qsl_cpu[num_decodes + 1 : prefill_end + 1]
                 - qsl_cpu[num_decodes:prefill_end]
@@ -960,7 +1030,7 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             prefill_context_lens = self.context_len_buffer[num_decodes:prefill_end]
             prefill_context_lens.copy_(
                 (
-                    prefill_kv_lens.detach().cpu() - prefill_query_lens_cpu
+                    prefill_kv_lens_cpu - prefill_query_lens_cpu
                 ).to(
                     device=self.context_len_buffer.device,
                     dtype=torch.int32,
@@ -977,6 +1047,10 @@ class AscendMiniMaxM3SparseMetadataBuilder(
             prefill_metadata = AscendMiniMaxM3SparsePrefillMetadata(
                 cu_seqlens_q=prefill_cu_seqlens_q,
                 cu_seqlens_k=prefill_cu_seqlens_k,
+                cu_block_lens=prefill_cu_block_lens,
+                k2q_total_rows=k2q_total_rows,
+                k2q_max_kv=k2q_max_kv,
+                block_size=self.block_size,
                 seq_lens=prefill_kv_lens,
                 actual_seq_lengths=prefill_actual_seq_lengths,
                 actual_seq_lengths_kv=prefill_actual_seq_lengths_kv,
@@ -1046,16 +1120,8 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         self.kv_cache_dtype = kv_cache_dtype
         self.topk_blocks = topk_blocks
         self.block_size = sparse_block_size
-        try:
-            pp_size = (
-                get_current_vllm_config().parallel_config.pipeline_parallel_size
-            )
-        except Exception:
-            pp_size = 1
         self.minimax_m3_sparse_attn_ascendc = (
-            minimax_m3_sparse_attn_ascendc_pp8
-            if pp_size == _SPARSE_ATTN_NEW_OP_PP_SIZE
-            else minimax_m3_sparse_attn_ascendc_legacy
+            minimax_m3_sparse_attn_ascendc_prefill
         )
         self._dequant_scale_buf: torch.Tensor | None = None
 
@@ -1187,7 +1253,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None and prefill_topk is not None
-            self.minimax_m3_sparse_attn_ascendc(
+            args = (
                 q[nd:],
                 kv_cache,
                 prefill_topk,
@@ -1199,7 +1265,19 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                 self.num_kv_heads,
                 self.scale,
                 out[nd:],
+            )
+            if p.block_size != self.block_size:
+                raise ValueError(
+                    "MiniMax M3 K2Q metadata block size does not match the "
+                    f"sparse attention block size: {p.block_size} != "
+                    f"{self.block_size}"
+                )
+            self.minimax_m3_sparse_attn_ascendc(
+                *args,
                 block_size=self.block_size,
+                cu_block_lens=p.cu_block_lens,
+                k2q_total_rows=p.k2q_total_rows,
+                k2q_max_kv=p.k2q_max_kv,
             )
         return output
 
@@ -1454,10 +1532,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
         self.indexer_kv_dtype = _resolve_indexer_kv_dtype(vllm_config)
-        self.kv_cache_dtype = (
-            cache_config.cache_dtype if cache_config is not None else "auto"
+        self.kv_cache_dtype = _resolve_main_kv_cache_dtype(
+            vllm_config,
+            cache_config,
         )
-        # self.kv_cache_dtype = "bfloat16"
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
@@ -1498,10 +1576,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         if not _SPARSE_ATTN_LOGGED:
             logger.warning(
                 "MiniMax M3 sparse attention enabled "
-                "(topk_blocks=%d, block_size=%d, local_index_cp=%d)",
+                "(topk_blocks=%d, block_size=%d, local_index_cp=%d, "
+                "main_kv_cache_dtype=%s)",
                 sparse_cfg["sparse_topk_blocks"],
                 sparse_cfg["sparse_block_size"],
                 self.qkv_proj.num_kv_head_replicas,
+                self.kv_cache_dtype,
             )
             _SPARSE_ATTN_LOGGED = True
 
@@ -1536,17 +1616,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        k_fp8 = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
-        v_fp8 = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
+        k_cache_update = _prepare_main_kv_cache_update(k_insert, key_cache)
+        v_cache_update = _prepare_main_kv_cache_update(v_insert, value_cache)
         from vllm_ascend.device.device_op import DeviceOperator
 
         DeviceOperator.reshape_and_cache(
-            k_fp8,
-            v_fp8,
+            k_cache_update,
+            v_cache_update,
             key_cache,
             value_cache,
             main_meta.slot_mapping[:num_tokens],
@@ -1609,7 +1685,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
 
         index_q, index_k = self._index_qk_norm(index_q, index_k)
-        # Indexer FP8: rotary_emb(..., out_dtype=e4m3) → Triton FP8 RoPE.
+        # Indexer FP8: rotary_emb(..., out_dtype=e4m3) ^R Triton FP8 RoPE.
         # Main Q/K above stay bf16. index_q/index_k then feed insert_kv + score.
         if self.indexer_kv_dtype in ("fp8", "fp8_e4m3"):
             index_q, index_k = self.rotary_emb(
