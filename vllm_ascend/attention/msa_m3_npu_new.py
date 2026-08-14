@@ -154,26 +154,49 @@ def minimax_m3_sparse_attn_decode(
     topk_active = topk_idx[:, :active_tokens]
     select_num_idx_active = select_num_idx[:, :active_tokens]
     key, value = _split_main_kv_cache(kv_cache)
-    q_fp8 = _to_fp8(q_active)
-    key_fp8 = key if key.dtype == torch.float8_e4m3fn else _to_fp8(key)
-    value_fp8 = value if value.dtype == torch.float8_e4m3fn else _to_fp8(value)
-    out = torch.ops._C_ascend.npu_sparse_attention_score(
-        q_fp8,
-        key_fp8,
-        value_fp8,
-        topk_active,
-        block_table,
-        select_num_idx=select_num_idx_active,
-        actual_seq_lengths=q_lens,
-        actual_seq_lengths_kv=seq_lens,
-        q_dequant_scale=dequant_scale_buf,
-        k_dequant_scale=dequant_scale_buf,
-        v_dequant_scale=dequant_scale_buf,
-        num_key_value_heads=num_kv_heads,
-        scale_value=sm_scale,
-        block_size=block_size,
-        top_k=topk_active.shape[-1],
-        inner_precise=_SPARSE_ATTN_INNER_PRECISE,
-        attention_out_dtype=torch.bfloat16,
-    )
+    if key.dtype == torch.float8_e4m3fn:
+        q_fp8 = _to_fp8(q_active)
+        value_fp8 = (
+            value if value.dtype == torch.float8_e4m3fn else _to_fp8(value)
+        )
+        out = torch.ops._C_ascend.npu_sparse_attention_score(
+            q_fp8,
+            key,
+            value_fp8,
+            topk_active,
+            block_table,
+            select_num_idx=select_num_idx_active,
+            actual_seq_lengths=q_lens,
+            actual_seq_lengths_kv=seq_lens,
+            q_dequant_scale=dequant_scale_buf,
+            k_dequant_scale=dequant_scale_buf,
+            v_dequant_scale=dequant_scale_buf,
+            num_key_value_heads=num_kv_heads,
+            scale_value=sm_scale,
+            block_size=block_size,
+            top_k=topk_active.shape[-1],
+            inner_precise=_SPARSE_ATTN_INNER_PRECISE,
+            attention_out_dtype=torch.bfloat16,
+        )
+    else:
+        if q_active.dtype != key.dtype or value.dtype != key.dtype:
+            raise TypeError(
+                "BF16 sparse attention requires query, key, and value to have "
+                f"the same dtype, got {q_active.dtype}, {key.dtype}, {value.dtype}"
+            )
+        out = torch.ops._C_ascend.npu_sparse_attention_score(
+            q_active,
+            key,
+            value,
+            topk_active,
+            block_table,
+            select_num_idx=select_num_idx_active,
+            actual_seq_lengths=q_lens,
+            actual_seq_lengths_kv=seq_lens,
+            num_key_value_heads=num_kv_heads,
+            scale_value=sm_scale,
+            block_size=block_size,
+            top_k=topk_active.shape[-1],
+            inner_precise=_SPARSE_ATTN_INNER_PRECISE,
+        )
     output[:active_tokens].copy_(out)
