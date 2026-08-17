@@ -4,10 +4,24 @@
 from __future__ import annotations
 
 import torch
+
 _SPARSE_ATTN_INNER_PRECISE = 4
 FP8_E4M3_MAX = 448.0
 
 from vllm_ascend.attention.k2q_csr import npu_k2q_csr
+
+
+def _ensure_prefill_op_registered() -> None:
+    """Import cann_ops_transformer registration for npu_sparse_attention_score_prefill."""
+    try:
+        import cann_ops_transformer.ops.sparse_attention_score_prefill  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "MiniMax-M3 sparse prefill requires cann_ops_transformer "
+            "(ops-transformer_msa sparse_attention_score_prefill). "
+            "Install the package and source set_env.bash before starting vllm."
+        ) from e
+
 
 def _split_main_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
@@ -71,6 +85,7 @@ def minimax_m3_sparse_attn(
     block_size: int = 128,
 ) -> None:
     del prefix_lens, max_query_len
+    _ensure_prefill_op_registered()
     key, value = _split_main_kv_cache(kv_cache)
     cu_block_lens = _build_cu_block_lens(seq_lens, block_size)
     k2q_row_ptr, k2q_q_indices, k2q_slot_indices = npu_k2q_csr(
@@ -79,29 +94,47 @@ def minimax_m3_sparse_attn(
         cu_block_lens,
         order_method=1,
         use_simt=0,
-        q_global_offset=True
+        q_global_offset=True,
     )
 
+    # cann_ops_transformer requires int32 contiguous indexes; seq lens are
+    # per-batch lengths (not cumulative). Arg order is positional only.
+    block_table = block_table.to(dtype=torch.int32).contiguous()
     k2q_row_ptr = k2q_row_ptr.to(dtype=torch.int32).contiguous()
     k2q_q_indices = k2q_q_indices.to(dtype=torch.int32).contiguous()
     k2q_slot_indices = k2q_slot_indices.to(dtype=torch.int32).contiguous()
-    q_lens_t = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32).contiguous()
-    kv_lens_t = seq_lens.to(torch.int32).contiguous()
-    out = torch.ops._C_ascend.npu_sparse_attention_score_prefill(
-        q,
-        key,
-        value,
+    actual_seq_lengths = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(
+        dtype=torch.int32
+    ).contiguous()
+    actual_seq_lengths_kv = seq_lens.to(dtype=torch.int32).contiguous()
+    top_k = int(topk_idx.shape[-1])
+
+    # Prefill FP8 is full-quant (no dequant scales); output is bf16.
+    q_fp8 = _to_fp8(q).contiguous()
+    if key.dtype == torch.float8_e4m3fn:
+        key_fp8 = key.contiguous()
+    else:
+        key_fp8 = _to_fp8(key).contiguous()
+    if value.dtype == torch.float8_e4m3fn:
+        value_fp8 = value.contiguous()
+    else:
+        value_fp8 = _to_fp8(value).contiguous()
+
+    out = torch.ops.cann_ops_transformer.npu_sparse_attention_score_prefill(
+        q_fp8,
+        key_fp8,
+        value_fp8,
         block_table,
         k2q_row_ptr,
         k2q_q_indices,
         k2q_slot_indices,
+        actual_seq_lengths,
+        actual_seq_lengths_kv,
         num_kv_heads,
         sm_scale,
         block_size,
-        topk_idx.shape[-1],
-        1,
-        actual_seq_lengths=q_lens_t,
-        actual_seq_lengths_kv=kv_lens_t,
+        top_k,
+        _SPARSE_ATTN_INNER_PRECISE,
     )
     output.copy_(out)
 
