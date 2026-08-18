@@ -93,6 +93,22 @@ def _resolve_indexer_kv_dtype(vllm_config: VllmConfig) -> str:
         dtype = additional.get("indexer_kv_dtype", "bf16")
     return str(dtype)
 
+def _resolve_sparse_attn_decode_dtype(vllm_config: VllmConfig) -> str:
+    """Resolve MiniMax-M3 decode sparse-attention compute dtype.
+
+    Reads ``additional_config["sparse_attn_decode_dtype"]``.
+    Supported values: ``"fp8"`` / ``"fp8_e4m3"`` / ``"bf16"``.
+    Defaults to ``"fp8"``.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    dtype = str(additional.get("sparse_attn_decode_dtype", "fp8")).lower()
+    if dtype not in ("fp8", "fp8_e4m3", "bf16"):
+        raise ValueError(
+            f"additional_config.sparse_attn_decode_dtype={dtype!r} is not "
+            "supported (only 'fp8'/'fp8_e4m3' or 'bf16')."
+        )
+    return dtype
+
 
 def _scatter_index_cache(
     cache: torch.Tensor,
@@ -1038,6 +1054,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         *,
         topk_blocks: int,
         sparse_block_size: int,
+        sparse_attn_decode_dtype: str = "fp8",
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -1046,6 +1063,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
         self.kv_cache_dtype = kv_cache_dtype
         self.topk_blocks = topk_blocks
         self.block_size = sparse_block_size
+        self.sparse_attn_decode_dtype = sparse_attn_decode_dtype
         try:
             pp_size = (
                 get_current_vllm_config().parallel_config.pipeline_parallel_size
@@ -1462,6 +1480,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype, vllm_config.model_config
         )
         self.attn_backend = AscendMiniMaxM3SparseBackend
+        self.sparse_attn_decode_dtype = _resolve_sparse_attn_decode_dtype(vllm_config)
         self.impl = AscendMiniMaxM3SparseImpl(
             self.num_heads,
             self.head_dim,
@@ -1470,6 +1489,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             kv_cache_dtype=self.kv_cache_dtype,
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
             sparse_block_size=sparse_cfg["sparse_block_size"],
+            sparse_attn_decode_dtype=self.sparse_attn_decode_dtype,
         )
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         self.sparse_block_size = sparse_cfg["sparse_block_size"]
@@ -1498,10 +1518,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         if not _SPARSE_ATTN_LOGGED:
             logger.warning(
                 "MiniMax M3 sparse attention enabled "
-                "(topk_blocks=%d, block_size=%d, local_index_cp=%d)",
+                "(topk_blocks=%d, block_size=%d, "
+                "sparse_attn_decode_dtype=%s)",
                 sparse_cfg["sparse_topk_blocks"],
                 sparse_cfg["sparse_block_size"],
-                self.qkv_proj.num_kv_head_replicas,
+                self.sparse_attn_decode_dtype,
             )
             _SPARSE_ATTN_LOGGED = True
 
@@ -1536,17 +1557,25 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        k_fp8 = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
-        v_fp8 = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
-            torch.float8_e4m3fn
-        )
+        if self.sparse_attn_decode_dtype in ("fp8", "fp8_e4m3"):
+            k_insert = k_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
+            v_insert = v_insert.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            )
+        else:
+            cache_dtype = key_cache.dtype
+            if k_insert.dtype != cache_dtype:
+                k_insert = k_insert.to(cache_dtype)
+            if v_insert.dtype != cache_dtype:
+                v_insert = v_insert.to(cache_dtype)
+        
         from vllm_ascend.device.device_op import DeviceOperator
 
         DeviceOperator.reshape_and_cache(
-            k_fp8,
-            v_fp8,
+            k_insert,
+            v_insert,
             key_cache,
             value_cache,
             main_meta.slot_mapping[:num_tokens],
