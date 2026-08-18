@@ -187,6 +187,8 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.builder.build(1, common_attn_metadata, mock_model)
 
+        self.assertEqual(mock_ascend_metadata.call_args.kwargs["actual_seq_lengths"], [2, 3, 4])
+
 
 class TestAscendAttentionBackendImpl(TestBase):
     def setUp(self):
@@ -337,8 +339,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertIs(args[6], self.impl.k_scale_cache)
 
     @patch(
-        "vllm_ascend.attention.attention_v1.torch_npu.npu_dense_attention_score",
-        create=True,
+        "vllm_ascend.attention.attention_v1.npu_dense_attention_score",
     )
     def test_dense_attention_score_minimax_m3_fp8(self, mock_dense_attention):
         self.impl.key_cache = torch.empty(
@@ -354,6 +355,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_dense_attention.return_value = dense_output
         metadata = SimpleNamespace(
             actual_seq_lengths_q=[1, 3],
+            actual_seq_lengths=[1, 2],
             seq_lens_list=[17, 20],
             block_tables=torch.tensor([[0, 1], [1, 0], [0, 0]], dtype=torch.int32),
             attn_state=AscendAttentionState.DecodeOnly,
@@ -388,8 +390,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertTrue(torch.equal(result, dense_output.permute(1, 0, 2)))
 
     @patch(
-        "vllm_ascend.attention.attention_v1.torch_npu.npu_dense_attention_score",
-        create=True,
+        "vllm_ascend.attention.attention_v1.npu_dense_attention_score",
     )
     def test_dense_attention_score_graph_uses_persistent_device_metadata(self, mock_dense_attention):
         self.impl.key_cache = torch.empty(
@@ -408,6 +409,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         )
         metadata = SimpleNamespace(
             actual_seq_lengths_q=[1, 2],
+            actual_seq_lengths=[1, 1],
             seq_lens_list=[17, 20],
             block_tables=block_tables,
             _dense_query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
@@ -430,30 +432,6 @@ class TestAscendAttentionBackendImpl(TestBase):
         # The padded graph row has KV length zero in the runner buffer; it is
         # normalized to its Q length so the custom op receives valid metadata.
         self.assertTrue(torch.equal(kwargs["actual_seq_lengths_kv"], torch.tensor([17, 1], dtype=torch.int32)))
-
-    def test_dense_attention_score_rejects_mismatched_batch_lengths(self):
-        self.impl.key_cache = torch.empty(
-            (2, 8, 16, 64),
-            dtype=torch.float8_e4m3fn,
-        )
-        self.impl.value_cache = torch.empty_like(self.impl.key_cache)
-        self.impl.k_scale_cache = torch.ones(
-            (2, 8, 16, 1),
-            dtype=torch.float32,
-        )
-        metadata = SimpleNamespace(
-            actual_seq_lengths_q=[1, 2],
-            seq_lens_list=[10],
-            block_tables=torch.tensor([[0]], dtype=torch.int32),
-            attn_state=AscendAttentionState.DecodeOnly,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "one Q length and one KV length"):
-            self.impl._forward_dense_attention_score_fp8(
-                torch.zeros((2, 8, 64), dtype=torch.bfloat16),
-                metadata,
-                torch.empty((2, 8, 64), dtype=torch.bfloat16),
-            )
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_large_head_prefill_uses_device_operator_fallback(self, mock_get_forward_context):

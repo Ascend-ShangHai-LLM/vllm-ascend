@@ -21,6 +21,7 @@ from enum import Enum
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
+from cann_ops_transformer.ops.dense_attention_score import npu_dense_attention_score
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
@@ -183,6 +184,7 @@ class AscendMetadata:
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
+    actual_seq_lengths: list[int] = None  # type: ignore
 
     query_start_loc: torch.Tensor = None
     # Maximum query length in the batch (None for decoding).
@@ -333,6 +335,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
+        actual_seq_lengths = (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).tolist()
         seq_lens_list = seq_lens.tolist()
         # flashcomm1/SP (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
@@ -378,6 +381,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths=actual_seq_lengths,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             attn_state=attn_state,
@@ -1283,15 +1287,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv,
         )
 
-    @staticmethod
-    def _cumulative_to_lengths(cumulative_lengths: list[int]) -> list[int]:
-        previous = 0
-        lengths = []
-        for cumulative_length in cumulative_lengths:
-            lengths.append(cumulative_length - previous)
-            previous = cumulative_length
-        return lengths
-
     def _fp8_scale_cache_view(self, shape: tuple[int, ...]) -> torch.Tensor:
         assert self.k_scale_cache is not None
         # MiniMax M3 uses fixed Q/K/V scales of 1.0. Reuse the already
@@ -1383,24 +1378,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ) = self._get_dense_attention_score_fp8_params(attn_metadata)
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
 
-        if block_table is None:
-            raise RuntimeError("DenseAttentionScore requires a paged KV cache block table.")
-
-        actual_seq_lengths = self._cumulative_to_lengths(attn_metadata.actual_seq_lengths_q)
+        actual_seq_lengths = attn_metadata.actual_seq_lengths
         batch_size = len(actual_seq_lengths_kv)
-        if len(actual_seq_lengths) != batch_size:
-            raise RuntimeError(
-                "DenseAttentionScore requires one Q length and one KV length "
-                f"per request, got {len(actual_seq_lengths)} and {batch_size}."
-            )
-        if not actual_seq_lengths or any(
-            query_length <= 0 or kv_length < query_length
-            for query_length, kv_length in zip(actual_seq_lengths, actual_seq_lengths_kv)
-        ):
-            raise RuntimeError(
-                "DenseAttentionScore requires positive Q lengths and KV "
-                "lengths greater than or equal to their Q lengths."
-            )
 
         query = (
             query[:num_tokens]
@@ -1436,21 +1415,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query.device,
             )
 
-        dense_attention_op = getattr(torch_npu, "npu_dense_attention_score", None)
-        if dense_attention_op is None:
-            try:
-                # The package root does not import this module. Importing the
-                # submodule registers npu_dense_attention_score on torch_npu.
-                import cann_ops_transformer.ops.dense_attention_score  # noqa: F401
-            except ImportError as exc:
-                raise RuntimeError(
-                    "MiniMax M3 FP8 attention requires the cann_ops_transformer DenseAttentionScore extension."
-                ) from exc
-            dense_attention_op = getattr(torch_npu, "npu_dense_attention_score", None)
-        if dense_attention_op is None:
-            raise RuntimeError("cann_ops_transformer did not register torch_npu.npu_dense_attention_score.")
-
-        attn_output = dense_attention_op(
+        attn_output = npu_dense_attention_score(
             query,
             key,
             value,
