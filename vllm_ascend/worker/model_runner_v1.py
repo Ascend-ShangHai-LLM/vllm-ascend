@@ -5001,7 +5001,25 @@ class NPUModelRunner(GPUModelRunner):
                         in ("fp8", "fp8_e4m3")
                     ):
                         assert isinstance(spec, FullAttentionSpec)
-                        spec = replace(spec, dtype=torch.float8_e4m3fn)
+                        # Gate MSA main-KV FP8 storage on
+                        # additional_config.sparse_attn_decode_dtype.
+                        if attn_module.sparse_attn_decode_dtype in (
+                            "fp8",
+                            "fp8_e4m3",
+                        ):
+                            spec = replace(spec, dtype=torch.float8_e4m3fn)
+                        else:
+                            # Keep global FP8 cache dtype for dense/indexer
+                            # layers, while MSA main KV stays native dtype.
+                            attn_module.kv_cache_dtype = "auto"
+                            attn_module.kv_cache_torch_dtype = self.dtype
+                            attn_module.impl.kv_cache_dtype = "auto"
+                            spec = replace(
+                                spec,
+                                dtype=self.dtype,
+                                kv_quant_mode=KVQuantMode.NONE,
+                                page_size_padded=None,
+                            )
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
 
