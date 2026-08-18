@@ -18,10 +18,10 @@
 from dataclasses import dataclass, field
 from enum import Enum
 
-import cann_ops_transformer  # noqa: F401
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
+from cann_ops_transformer.ops.dense_attention_score import npu_dense_attention_score
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
@@ -1415,7 +1415,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query.device,
             )
 
-        attn_output = torch_npu.npu_dense_attention_score(
+        attn_output = npu_dense_attention_score(
             query,
             key,
             value,
