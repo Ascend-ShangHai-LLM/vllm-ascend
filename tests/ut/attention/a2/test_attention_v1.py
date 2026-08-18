@@ -339,7 +339,8 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertIs(args[6], self.impl.k_scale_cache)
 
     @patch(
-        "vllm_ascend.attention.attention_v1.npu_dense_attention_score",
+        "vllm_ascend.attention.attention_v1.torch_npu.npu_dense_attention_score",
+        create=True,
     )
     def test_dense_attention_score_minimax_m3_fp8(self, mock_dense_attention):
         self.impl.key_cache = torch.empty(
@@ -390,7 +391,8 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertTrue(torch.equal(result, dense_output.permute(1, 0, 2)))
 
     @patch(
-        "vllm_ascend.attention.attention_v1.npu_dense_attention_score",
+        "vllm_ascend.attention.attention_v1.torch_npu.npu_dense_attention_score",
+        create=True,
     )
     def test_dense_attention_score_graph_uses_persistent_device_metadata(self, mock_dense_attention):
         self.impl.key_cache = torch.empty(
