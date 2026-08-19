@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import torch
+
 _SPARSE_ATTN_INNER_PRECISE = 4
 FP8_E4M3_MAX = 448.0
 
+import cann_ops_transformer.ops.sparse_attention_score_prefill  # noqa: F401
 from vllm_ascend.attention.k2q_csr import npu_k2q_csr
 
 def _split_main_kv_cache(
@@ -87,21 +89,26 @@ def minimax_m3_sparse_attn(
     k2q_slot_indices = k2q_slot_indices.to(dtype=torch.int32).contiguous()
     q_lens_t = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32).contiguous()
     kv_lens_t = seq_lens.to(torch.int32).contiguous()
-    out = torch.ops._C_ascend.npu_sparse_attention_score_prefill(
-        q,
-        key,
-        value,
+    # Prefill FP8 is full-quant: clamp+cast Q/K/V, no dequant scales.
+    q_fp8 = _to_fp8(q)
+    key_fp8 = key if key.dtype == torch.float8_e4m3fn else _to_fp8(key)
+    value_fp8 = value if value.dtype == torch.float8_e4m3fn else _to_fp8(value)
+
+    out = torch.ops.cann_ops_transformer.npu_sparse_attention_score_prefill(
+        q_fp8,
+        key_fp8,
+        value_fp8,
         block_table,
         k2q_row_ptr,
         k2q_q_indices,
         k2q_slot_indices,
+        q_lens_t,
+        kv_lens_t,
         num_kv_heads,
         sm_scale,
         block_size,
-        topk_idx.shape[-1],
-        1,
-        actual_seq_lengths=q_lens_t,
-        actual_seq_lengths_kv=kv_lens_t,
+        int(topk_idx.shape[-1]),
+        inner_precise=4,
     )
     output.copy_(out)
 
