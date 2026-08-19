@@ -20,9 +20,17 @@ export TASK_QUEUE_ENABLE=1
 export VLLM_TORCH_PROFILER_DIR="/home/z00946994/profiling"
 export VLLM_TORCH_PROFILER_WITH_STACK=0
 export ASCEND_LAUNCH_BLOCKING=0
-# for sparse attention
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.1.T560/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
-export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-9.1.T560/opp/vendors/custom_transformer/op_api/lib/:$ASCEND_CUSTOM_OPP_PATH
+# Load the same custom-operator package that was installed and validated by
+# msa_simple_example.py. ASCEND_CUSTOM_OPP_PATH must point to the vendor root;
+# the aclnn loader appends /op_api/lib/libcust_opapi.so itself.
+custom_transformer_root="/home/w00943508/minimax-m3/gqa-fp8-0812/package/package_custom_d7ddd7/vendors/custom_transformer"
+if [ ! -f "${custom_transformer_root}/bin/set_env.bash" ] || \
+   [ ! -f "${custom_transformer_root}/op_api/lib/libcust_opapi.so" ]; then
+    echo "DenseAttentionScore custom operator is not installed under ${custom_transformer_root}" >&2
+    exit 1
+fi
+source /usr/local/Ascend/cann/set_env.sh
+source "${custom_transformer_root}/bin/set_env.bash"
 export PATH=/home/g00893696/ascendnpu-ir/tools/bishengir/bin:$PATH
 
 # flash_comm
@@ -57,7 +65,7 @@ vllm serve /home/g00893696/weight/MiniMax-M3-MXFP8/  \
      --kv-cache-dtype fp8 \
      --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
      --safetensors-load-strategy 'prefetch' \
-     --additional-config '{"enable_cpu_binding":true,"ascend_compilation_config":{"fuse_qknorm_rope":false, "fuse_norm_quant":false}, "indexer_kv_dtype": "fp8", "multistream_overlap_shared_expert": true}' \
+     --additional-config '{"enable_cpu_binding":true,"enable_gqa_kv_cache_fp8":true,"ascend_compilation_config":{"fuse_qknorm_rope":false, "fuse_norm_quant":false}, "indexer_kv_dtype": "fp8", "multistream_overlap_shared_expert": true}' \
      --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/x30075441/prof/minimax_486t_deocde_sp_score_fp8_729", "torch_profiler_with_stack": false}' \
      > decode_log/minimax_486t_decode_128k_bs8_0724_force3.log 2>&1 &
 
