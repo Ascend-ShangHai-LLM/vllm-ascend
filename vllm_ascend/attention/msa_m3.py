@@ -10,7 +10,11 @@ import torch
 import torch_npu
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -456,6 +460,74 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             indexer_kv_dtype=indexer_kv_dtype,
         )
 
+    def _decode_topk_tp_sharded(
+        self,
+        idx_q: torch.Tensor,
+        index_kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        decode_query_len: int,
+        max_decode_query_len: int,
+        tp_group: Any,
+        tp_size: int,
+        tp_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        full_idx_q = tp_group.all_gather(idx_q.contiguous(), dim=1)
+
+        max_block_count = (max_seq_len + self.block_size - 1) // self.block_size
+        blocks_per_tp = (max_block_count + tp_size - 1) // tp_size
+        block_offset = tp_rank * blocks_per_tp
+        block_count = max(0, min(blocks_per_tp, max_block_count - block_offset))
+        local_block_table = block_table[
+            :, block_offset : block_offset + block_count
+        ].contiguous()
+        local_seq_lens = torch.clamp(
+            seq_lens - block_offset * self.block_size,
+            min=0,
+            max=block_count * self.block_size,
+        )
+
+        local_topk, local_scores = minimax_m3_index_decode(
+            full_idx_q,
+            index_kv_cache,
+            local_block_table,
+            local_seq_lens,
+            max_seq_len,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            full_idx_q.shape[1],
+            decode_query_len,
+            max_decode_query_len=max_decode_query_len,
+            sm_scale=self.scale,
+            block_offset=block_offset,
+            block_count=block_count,
+            global_seq_lens=seq_lens,
+            return_scores=True,
+        )
+        gathered_scores = tp_group.all_gather(local_scores.contiguous(), dim=-1)
+        gathered_topk = tp_group.all_gather(local_topk.contiguous(), dim=-1)
+
+        local_head_count = idx_q.shape[1]
+        local_head_start = tp_rank * local_head_count
+        local_gathered_scores = gathered_scores.narrow(
+            0, local_head_start, local_head_count
+        )
+        _, merged_pos = torch.topk(
+            local_gathered_scores,
+            k=self.topk_blocks,
+            dim=-1,
+        )
+        local_gathered_topk = gathered_topk.narrow(
+            0, local_head_start, local_head_count
+        )
+        merged_topk = torch.gather(
+            local_gathered_topk, dim=-1, index=merged_pos
+        )
+        select_num_idx = _select_num_idx_from_topk(merged_topk)
+        return merged_topk, select_num_idx
+
     def forward(
         self,
         index_query: torch.Tensor,
@@ -482,20 +554,39 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         if index_md.num_decodes > 0:
             d = index_md.decode
             assert d is not None
-            decode_topk, decode_select_num_idx = minimax_m3_index_decode(
-                iq[:nd],
-                kv,
-                d.block_table,
-                d.seq_lens,
-                d.max_seq_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                d.decode_query_len,
-                d.max_decode_query_len,
-                sm_scale=self.scale,
-            )
+            tp_group = get_tp_group()
+            tp_size = tp_group.world_size
+            decode_iq = iq[:nd]
+            if tp_size > 1 and index_md.num_prefills == 0:
+                decode_topk, decode_select_num_idx = (
+                    self._decode_topk_tp_sharded(
+                        decode_iq,
+                        kv,
+                        d.block_table,
+                        d.seq_lens,
+                        d.max_seq_len,
+                        d.decode_query_len,
+                        d.max_decode_query_len,
+                        tp_group,
+                        tp_size,
+                        tp_group.rank_in_group,
+                    )
+                )
+            else:
+                decode_topk, decode_select_num_idx = minimax_m3_index_decode(
+                    decode_iq,
+                    kv,
+                    d.block_table,
+                    d.seq_lens,
+                    d.max_seq_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    d.decode_query_len,
+                    d.max_decode_query_len,
+                    sm_scale=self.scale,
+                )
         if index_md.num_prefills > 0:
             p = index_md.prefill
             assert p is not None
