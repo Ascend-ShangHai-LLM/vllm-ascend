@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_tp_group,
 )
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm_ascend import envs as ascend_envs
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -130,6 +131,9 @@ def _scatter_index_cache(
         raise ValueError(f"Unexpected index cache ndim: {cache.ndim}")
     key = updates.reshape(num_tokens, 1, head_dim).contiguous()
     torch_npu.npu_scatter_pa_cache(key, slots, key_cache=pa_cache)
+
+
+_INDEX_TP_SHARD_DEBUG_PRINTED = False
 
 
 def _select_num_idx_from_topk(topk_idx: torch.Tensor) -> torch.Tensor:
@@ -506,8 +510,15 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             global_seq_lens=seq_lens,
             return_scores=True,
         )
-        gathered_scores = tp_group.all_gather(local_scores.contiguous(), dim=-1)
-        gathered_topk = tp_group.all_gather(local_topk.contiguous(), dim=-1)
+        # Fuse score/id allgather into one collective to cut HCCL launches.
+        # Layout [H, Q, 2, K] → gather on K → [H, Q, 2, K*TP].
+        packed = torch.stack(
+            (local_scores, local_topk.to(dtype=local_scores.dtype)),
+            dim=-2,
+        ).contiguous()
+        gathered = tp_group.all_gather(packed, dim=-1)
+        gathered_scores = gathered.select(dim=-2, index=0)
+        gathered_topk = gathered.select(dim=-2, index=1).to(dtype=local_topk.dtype)
 
         local_head_count = idx_q.shape[1]
         local_head_start = tp_rank * local_head_count
@@ -557,7 +568,31 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             tp_group = get_tp_group()
             tp_size = tp_group.world_size
             decode_iq = iq[:nd]
-            if tp_size > 1 and index_md.num_prefills == 0:
+            max_block_count = (
+                d.max_seq_len + self.block_size - 1
+            ) // self.block_size
+            min_blocks = ascend_envs.VLLM_ASCEND_INDEX_TP_SHARD_MIN_BLOCKS
+            use_tp_shard = (
+                ascend_envs.VLLM_ASCEND_ENABLE_INDEX_TP_SHARD
+                and tp_size > 1
+                and index_md.num_prefills == 0
+                and (min_blocks <= 0 or max_block_count >= min_blocks)
+            )
+            if ascend_envs.VLLM_ASCEND_INDEX_TP_SHARD_DEBUG:
+                global _INDEX_TP_SHARD_DEBUG_PRINTED
+                if not _INDEX_TP_SHARD_DEBUG_PRINTED:
+                    _INDEX_TP_SHARD_DEBUG_PRINTED = True
+                    print(
+                        "[index-tp-shard] "
+                        f"enable={ascend_envs.VLLM_ASCEND_ENABLE_INDEX_TP_SHARD} "
+                        f"use={use_tp_shard} tp={tp_size} "
+                        f"prefills={index_md.num_prefills} "
+                        f"max_blocks={max_block_count} "
+                        f"min_blocks={min_blocks} "
+                        f"local_h={decode_iq.shape[1]}",
+                        flush=True,
+                    )
+            if use_tp_shard:
                 decode_topk, decode_select_num_idx = (
                     self._decode_topk_tp_sharded(
                         decode_iq,

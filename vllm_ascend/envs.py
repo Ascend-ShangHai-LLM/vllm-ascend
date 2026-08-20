@@ -110,6 +110,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # MiniMax-M3 decode index: TP sequence-block sharding (#13142-style).
+    # "1": enable when tp_size>1 and decode-only; "0": force legacy full-sequence path.
+    "VLLM_ASCEND_ENABLE_INDEX_TP_SHARD": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_INDEX_TP_SHARD", "1"))
+    ),
+    # Only enter TP sharding when global max blocks >= this (amortize allgather).
+    # Default 256 (~32k tokens at block_size=128). Set 0 to disable the threshold.
+    "VLLM_ASCEND_INDEX_TP_SHARD_MIN_BLOCKS": lambda: int(
+        os.getenv("VLLM_ASCEND_INDEX_TP_SHARD_MIN_BLOCKS", "256")
+    ),
+    # Print one-time debug line when index TP sharding path is taken / skipped.
+    "VLLM_ASCEND_INDEX_TP_SHARD_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_INDEX_TP_SHARD_DEBUG", "0"))
+    ),
 }
 
 # end-env-vars-definition
