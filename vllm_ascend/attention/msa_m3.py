@@ -1276,8 +1276,12 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
+        # 方案 B: both index_q and index_k are replicated — every rank loads
+        # the full weight. q/k/v keep their existing TP sharding.
         num_heads = (
-            self.tp_size if loaded_shard_id == "index_k" else self.num_kv_head_replicas
+            self.tp_size
+            if loaded_shard_id in ("index_q", "index_k")
+            else self.num_kv_head_replicas
         )
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
@@ -1311,7 +1315,8 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         param_data = param.data.narrow(output_dim, shard_offset, shard_size)
         if loaded_shard_id == "q":
             shard_rank = self.tp_rank
-        elif loaded_shard_id == "index_k":
+        # 方案 B: index_q is replicated (like index_k) — load from rank 0.
+        elif loaded_shard_id in ("index_k", "index_q"):
             shard_rank = 0
         else:
             shard_rank = self.tp_rank // self.num_kv_head_replicas
