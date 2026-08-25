@@ -306,15 +306,17 @@ def _index_block_score_kernel(
 # constants so the grid is fixed within a cuda graph. The score scale is omitted
 # because decode only consumes block ordering.
 # ---------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["decode_query_len"])
+@triton.jit(do_not_specialize=["decode_query_len", "block_offset"])
 def _decode_qk_score_kernel(
     q_ptr,
     ik_cache_ptr,
     score_ptr,
     block_table_ptr,
     seq_lens_ptr,
+    global_seq_lens_ptr,
     num_idx_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    block_offset,
     decode_query_len,
     init_blocks: tl.constexpr,
     local_blocks: tl.constexpr,
@@ -344,14 +346,21 @@ def _decode_qk_score_kernel(
     request_id = query_id // decode_query_len
     query_offset = query_id - request_id * decode_query_len
 
-    seq_len = tl.load(seq_lens_ptr + request_id)
-    kv_length = tl.maximum(
-        seq_len - decode_query_len + query_offset + 1,
-        0,
+    local_seq_len = tl.load(seq_lens_ptr + request_id)
+    global_seq_len = tl.load(global_seq_lens_ptr + request_id)
+    global_kv_length = tl.maximum(
+        global_seq_len - decode_query_len + query_offset + 1, 0
+    )
+    kv_length = tl.minimum(
+        tl.maximum(global_kv_length - block_offset * BLOCK_SIZE_K, 0),
+        local_seq_len,
     )
     valid_blocks = (kv_length + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     full_block_count = kv_length // BLOCK_SIZE_K
-    local_start = tl.maximum(valid_blocks - local_blocks, 0)
+    global_valid_blocks = (
+        global_kv_length + BLOCK_SIZE_K - 1
+    ) // BLOCK_SIZE_K
+    local_start = tl.maximum(global_valid_blocks - local_blocks, 0)
 
     # Split only the visible range. Empty chunks return before loading Q.
     chunk_size_blocks = (valid_blocks + NUM_CHUNKS - 1) // NUM_CHUNKS
@@ -375,6 +384,7 @@ def _decode_qk_score_kernel(
     # Fully visible blocks require no token-position generation or causal mask.
     full_end = tl.minimum(chunk_end, full_block_count)
     for block_id in tl.range(chunk_start, full_end):
+        global_block_id = block_id + block_offset
         page_id = tl.load(block_table_row + block_id).to(tl.int64)
         key = tl.load(
             ik_cache_ptr
@@ -389,8 +399,8 @@ def _decode_qk_score_kernel(
 
         # Preserve source priority: local is applied after init and overrides it
         # when the two forced regions overlap.
-        block_score = tl.where(block_id < init_blocks, 1e30, block_score)
-        block_score = tl.where(block_id >= local_start, 1e29, block_score)
+        block_score = tl.where(global_block_id < init_blocks, 1e30, block_score)
+        block_score = tl.where(global_block_id >= local_start, 1e29, block_score)
 
         tl.store(
             score_ptr
@@ -408,6 +418,7 @@ def _decode_qk_score_kernel(
         & (boundary_block < chunk_end)
     )
     if boundary_in_chunk:
+        global_boundary_block = boundary_block + block_offset
         page_id = tl.load(block_table_row + boundary_block).to(tl.int64)
         key = tl.load(
             ik_cache_ptr
@@ -423,8 +434,12 @@ def _decode_qk_score_kernel(
             float("-inf"),
         )
         block_score = tl.max(query_key, axis=1)
-        block_score = tl.where(boundary_block < init_blocks, 1e30, block_score)
-        block_score = tl.where(boundary_block >= local_start, 1e29, block_score)
+        block_score = tl.where(
+            global_boundary_block < init_blocks, 1e30, block_score
+        )
+        block_score = tl.where(
+            global_boundary_block >= local_start, 1e29, block_score
+        )
 
         tl.store(
             score_ptr
@@ -440,13 +455,15 @@ def _decode_qk_score_kernel(
 # Forced init/local blocks are already encoded in the scores.
 # ---------------------------------------------------------------------------
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
-@triton.jit(do_not_specialize=["decode_query_len"])
+@triton.jit(do_not_specialize=["decode_query_len", "block_offset"])
 def _index_topk_postprocess_kernel(
     ti_in_ptr,  # [num_idx_heads, total_q, topk] int64 in (torch.topk indices)
     ti_out_ptr,  # [num_idx_heads, total_q, topk] int32 out (masked block ids)
     sni_ptr,  # [num_idx_heads, total_q] int32 out (valid block count per head/q)
-    seq_lens,  # [num_reqs]
+    seq_lens,  # local sequence lengths inside this block shard, [num_reqs]
+    global_seq_lens,  # full sequence lengths, [num_reqs]
     block_size: tl.constexpr,  # sparse block size (128)
+    block_offset,
     topk: tl.constexpr,
     decode_query_len,
     stride_in_h,
@@ -464,11 +481,15 @@ def _index_topk_postprocess_kernel(
     req_id = pid_b // decode_query_len
     q_offset = pid_b - req_id * decode_query_len
 
-    seq_len = tl.load(seq_lens + req_id)
-    query_pos = seq_len - decode_query_len + q_offset
+    local_seq_len = tl.load(seq_lens + req_id)
+    global_seq_len = tl.load(global_seq_lens + req_id)
+    query_pos = global_seq_len - decode_query_len + q_offset
     # Full-CG padding uses zero-length request rows. Clamp to an empty
     # attention range instead of letting padded rows produce negative lengths.
-    kv_len = tl.maximum(query_pos + 1, 0)
+    kv_len = tl.minimum(
+        tl.maximum(query_pos + 1 - block_offset * block_size, 0),
+        local_seq_len,
+    )
     num_blocks = (kv_len + block_size - 1) // block_size
 
     off_t = tl.arange(0, BLOCK_SIZE_T)
@@ -481,7 +502,7 @@ def _index_topk_postprocess_kernel(
     idx = tl.load(ti_in_ptrs, mask=store_mask, other=0)
     valid_slot = off_t < tl.minimum(topk, num_blocks)
     valid_idx = (idx >= 0) & (idx < num_blocks)
-    masked_idx = tl.where(valid_slot & valid_idx, idx, -1)
+    masked_idx = tl.where(valid_slot & valid_idx, idx + block_offset, -1)
     ti_out_ptrs = (
         ti_out_ptr + pid_h * stride_out_h + pid_b * stride_out_b + off_t * stride_out_t
     )
@@ -875,12 +896,18 @@ def minimax_m3_index_decode(
     max_decode_query_len: int = None,
     out: torch.Tensor | None = None,
     sm_scale = None,
-) -> torch.Tensor:
+    block_offset: int = 0,
+    block_count: int | None = None,
+    global_seq_lens: torch.Tensor | None = None,
+    return_scores: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode index block-score + top-k (torch.topk + invalid-index mask).
 
-    Returns (topk_idx, select_num_idx):
+    Returns ``(topk_idx, select_num_idx)`` by default:
       - topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
       - select_num_idx [num_kv_heads, total_q] int32 (valid block count).
+    When ``return_scores`` is true, the second tensor contains the corresponding
+    top-k scores instead, with invalid entries set to ``-inf``.
     When ``out`` ([num_kv_heads, >=total_q, topk]) is given, writes into
     ``out[:, :total_q, :]`` (stable address for cudagraph) instead of allocating.
     """
@@ -893,8 +920,18 @@ def minimax_m3_index_decode(
         max_decode_query_len = decode_query_len
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
+    if global_seq_lens is None:
+        global_seq_lens = seq_lens
+    assert global_seq_lens.shape[0] == seq_lens.shape[0]
     batch = total_q
-    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    global_max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    if block_count is None:
+        max_block = global_max_block
+    else:
+        max_block = max(
+            0,
+            min(block_count, global_max_block - block_offset),
+        )
     del sm_scale
 
     # Keep score strides 16-divisible to avoid Triton recompiles. The score
@@ -927,8 +964,10 @@ def minimax_m3_index_decode(
         score,
         block_table,
         seq_lens,
+        global_seq_lens,
         num_idx_heads,
         head_dim,
+        block_offset,
         decode_query_len,
         init_blocks,
         local_blocks,
@@ -950,7 +989,7 @@ def minimax_m3_index_decode(
     # the mask kernel below (read int64, write int32), avoiding a standalone
     # cast op. score_block_stride >= topk, so k=topk always yields exactly
     # `topk` entries -- invalid tail entries are masked to -1 by the kernel.
-    _, topk_idx_raw = torch.topk(score, k=topk, dim=-1)
+    topk_scores, topk_idx_raw = torch.topk(score, k=topk, dim=-1)
     if out is not None:
         topk_idx = out[:, :total_q, :]
     else:
@@ -965,7 +1004,9 @@ def minimax_m3_index_decode(
         topk_idx,
         select_num_idx,
         seq_lens,
+        global_seq_lens,
         SPARSE_BLOCK_SIZE,
+        block_offset,
         topk,
         decode_query_len,
         topk_idx_raw.stride(0),
@@ -977,6 +1018,13 @@ def minimax_m3_index_decode(
         select_num_idx.stride(0),
         select_num_idx.stride(1),
     )
+    if return_scores:
+        topk_scores = torch.where(
+            topk_idx >= 0,
+            topk_scores,
+            float("-inf"),
+        )
+        return topk_idx, topk_scores
     return topk_idx, select_num_idx
 
 

@@ -110,6 +110,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable context parallelism (CP) for the MiniMax-M3 indexer
+    # decode path. When enabled, the Index-K sequence-block range is sharded
+    # across the CP group (ranks that share the same replicated index-K head)
+    # and local top-k candidates are all-gathered + merged into the global
+    # top-k. The CP group size is tp_size // indexer_num_kv_heads; for M3 the
+    # index-K cache is a single shared head (indexer_num_kv_heads=1), so the
+    # CP group is the full TP group and cp_size == tp_size.
+    # 0 (default): single-rank decode indexer; 1: CP-sharded decode indexer.
+    "VLLM_ASCEND_MINIMAX_M3_INDEXER_CP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_MINIMAX_M3_INDEXER_CP", "0"))
+    ),
 }
 
 # end-env-vars-definition

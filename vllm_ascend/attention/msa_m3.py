@@ -7,11 +7,14 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
-import torch.distributed as dist
 import torch_npu
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -62,8 +65,8 @@ from vllm_ascend.attention.msa_m3_ops import (
     minimax_m3_sparse_attn_torch as minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode_torch as minimax_m3_sparse_attn_decode,
 )
-from vllm_ascend.distributed.parallel_state import get_kv_head_replica_group
 import vllm_ascend.ops.minimax_m3_sparse  # noqa: F401
+from vllm_ascend import envs
 from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
 
@@ -72,7 +75,6 @@ logger = init_logger(__name__)
 
 _SPARSE_ATTN_LOGGED = False
 FP8_E4M3_MAX = 448.0
-_INDEX_LOCAL_CP_QUERY_TILE_SIZE = 128
 
 
 
@@ -190,59 +192,6 @@ def _active_prefill_num_reqs(
     return min(1, num_prefills)
 
 
-def _build_local_cp_query_tile_layout(
-    query_lens_cpu: torch.Tensor,
-    local_cp_size: int,
-    local_cp_rank: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Pack round-robin query tiles as independent local pseudo requests.
-
-    Returns query indices into the original flattened prefill tensor, original
-    request indices and offsets for every pseudo request, its cu-seqlens, and
-    the maximum local pseudo-request length.
-    """
-    query_index_parts: list[torch.Tensor] = []
-    request_indices: list[int] = []
-    request_offsets: list[int] = []
-    local_cu_seqlens = [0]
-    max_local_query_len = 0
-    query_base = 0
-
-    for request_index, query_len in enumerate(query_lens_cpu.tolist()):
-        num_tiles = (query_len + _INDEX_LOCAL_CP_QUERY_TILE_SIZE - 1) // _INDEX_LOCAL_CP_QUERY_TILE_SIZE
-        for tile_index in range(local_cp_rank, num_tiles, local_cp_size):
-            request_offset = tile_index * _INDEX_LOCAL_CP_QUERY_TILE_SIZE
-            tile_len = min(
-                _INDEX_LOCAL_CP_QUERY_TILE_SIZE,
-                query_len - request_offset,
-            )
-            query_index_parts.append(
-                torch.arange(
-                    query_base + request_offset,
-                    query_base + request_offset + tile_len,
-                    dtype=torch.int64,
-                )
-            )
-            request_indices.append(request_index)
-            request_offsets.append(request_offset)
-            local_cu_seqlens.append(local_cu_seqlens[-1] + tile_len)
-            max_local_query_len = max(max_local_query_len, tile_len)
-        query_base += query_len
-
-    query_indices = (
-        torch.cat(query_index_parts)
-        if query_index_parts
-        else torch.empty(0, dtype=torch.int64)
-    )
-    return (
-        query_indices,
-        torch.tensor(request_indices, dtype=torch.int64),
-        torch.tensor(request_offsets, dtype=torch.int32),
-        torch.tensor(local_cu_seqlens, dtype=torch.int32),
-        max_local_query_len,
-    )
-
-
 class AscendMiniMaxM3IndexerBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -341,16 +290,6 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
 
 
 @dataclass
-class AscendMiniMaxM3IndexerLocalCPMetadata:
-    query_indices: torch.Tensor
-    cu_seqlens_q: torch.Tensor
-    seq_lens: torch.Tensor
-    context_lens: torch.Tensor
-    block_table: torch.Tensor
-    max_query_len: int
-
-
-@dataclass
 class AscendMiniMaxM3IndexerPrefillMetadata:
     cu_seqlens_q: torch.Tensor
     seq_lens: torch.Tensor
@@ -358,7 +297,6 @@ class AscendMiniMaxM3IndexerPrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_len: int
-    local_cp: AscendMiniMaxM3IndexerLocalCPMetadata | None = None
 
 
 @dataclass
@@ -398,7 +336,6 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.device = device
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.max_decode_query_len = self.reorder_batch_threshold
         self.context_len_buffer = torch.empty(
@@ -406,24 +343,6 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
             dtype=torch.int32,
             device=device,
         )
-        total_num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-        tensor_parallel_size = vllm_config.parallel_config.tensor_parallel_size
-        self.local_cp_size = 1
-        self.local_cp_rank = 0
-        if (
-            isinstance(total_num_kv_heads, int)
-            and total_num_kv_heads > 0
-            and tensor_parallel_size > total_num_kv_heads
-            and tensor_parallel_size % total_num_kv_heads == 0
-        ):
-            self.local_cp_size = tensor_parallel_size // total_num_kv_heads
-            local_cp_group = get_kv_head_replica_group()
-            if local_cp_group.world_size != self.local_cp_size:
-                raise RuntimeError(
-                    "M3 indexer metadata head-replica group size mismatch: "
-                    f"expected {self.local_cp_size}, got {local_cp_group.world_size}"
-                )
-            self.local_cp_rank = local_cp_group.rank_in_group
 
     def build(
         self,
@@ -456,18 +375,12 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
                 qsl_cpu[num_decodes + 1 : prefill_end + 1]
                 - qsl_cpu[num_decodes:prefill_end]
             )
-            prefill_seq_lens_cpu = (
-                seq_lens[num_decodes:prefill_end]
-                .detach()
-                .cpu()
-                .to(torch.int32)
-            )
-            prefill_context_lens_cpu = (
-                prefill_seq_lens_cpu - prefill_query_lens_cpu
-            )
             prefill_context_lens = self.context_len_buffer[num_decodes:prefill_end]
             prefill_context_lens.copy_(
-                prefill_context_lens_cpu.to(
+                (
+                    seq_lens[num_decodes:prefill_end].detach().cpu()
+                    - prefill_query_lens_cpu
+                ).to(
                     device=self.context_len_buffer.device,
                     dtype=torch.int32,
                     non_blocking=True,
@@ -477,71 +390,6 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
             cu_seqlens_q = (
                 query_start_loc[num_decodes : prefill_end + 1] - num_decode_tokens
             ).to(torch.int32)
-            local_cp_metadata: AscendMiniMaxM3IndexerLocalCPMetadata | None = None
-            if self.local_cp_size > 1:
-                (
-                    local_query_indices_cpu,
-                    local_request_indices_cpu,
-                    local_request_offsets_cpu,
-                    local_cu_seqlens_cpu,
-                    local_max_query_len,
-                ) = _build_local_cp_query_tile_layout(
-                    prefill_query_lens_cpu,
-                    self.local_cp_size,
-                    self.local_cp_rank,
-                )
-                local_query_indices = local_query_indices_cpu.to(
-                    device=self.device,
-                    non_blocking=True,
-                )
-                local_request_indices = local_request_indices_cpu.to(
-                    device=self.device,
-                    non_blocking=True,
-                )
-                local_request_offsets = local_request_offsets_cpu.to(
-                    device=self.device,
-                    non_blocking=True,
-                )
-                local_cu_seqlens = local_cu_seqlens_cpu.to(
-                    device=self.device,
-                    non_blocking=True,
-                )
-                prefill_seq_lens = seq_lens[num_decodes:prefill_end]
-                prefill_block_table = block_table[num_decodes:prefill_end]
-                num_local_tiles = local_request_indices.shape[0]
-                # seq_lens is addressed as a flat pointer by the Triton kernel,
-                # so it must be materialized rather than stride-0 expanded.
-                local_seq_lens = torch.index_select(
-                    prefill_seq_lens,
-                    0,
-                    local_request_indices,
-                )
-                if active_prefills == 1:
-                    # block_table supplies its row stride to the kernel, so a
-                    # stride-0 view safely avoids duplicating a 1M-context table.
-                    local_block_table = prefill_block_table.expand(
-                        num_local_tiles,
-                        -1,
-                    )
-                else:
-                    local_block_table = torch.index_select(
-                        prefill_block_table,
-                        0,
-                        local_request_indices,
-                    )
-                local_context_lens = torch.index_select(
-                    prefill_context_lens,
-                    0,
-                    local_request_indices,
-                ) + local_request_offsets
-                local_cp_metadata = AscendMiniMaxM3IndexerLocalCPMetadata(
-                    query_indices=local_query_indices,
-                    cu_seqlens_q=local_cu_seqlens,
-                    seq_lens=local_seq_lens,
-                    context_lens=local_context_lens,
-                    block_table=local_block_table,
-                    max_query_len=local_max_query_len,
-                )
             prefill_metadata = AscendMiniMaxM3IndexerPrefillMetadata(
                 cu_seqlens_q=cu_seqlens_q,
                 seq_lens=seq_lens[num_decodes:prefill_end],
@@ -549,7 +397,6 @@ class AscendMiniMaxM3IndexerMetadataBuilder(
                 block_table=block_table[num_decodes:prefill_end],
                 max_query_len=common_attn_metadata.max_query_len,
                 max_seq_len=common_attn_metadata.max_seq_len,
-                local_cp=local_cp_metadata,
             )
 
         decode_metadata: AscendMiniMaxM3IndexerDecodeMetadata | None = None
@@ -597,7 +444,9 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: str = "bf16",
-        head_replica_size: int = 1,
+        indexer_num_kv_heads: int = 1,
+        total_num_index_heads: int | None = None,
+        num_index_head_replicas: int = 1,
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -608,23 +457,124 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         self.local_blocks = local_blocks
         self.num_index_heads = num_index_heads
         self.index_head_dim = index_head_dim
-        self.local_cp_size = head_replica_size
-        self.local_cp_rank = 0
-        self.local_cp_group = None
-        if self.local_cp_size > 1:
-            self.local_cp_group = get_kv_head_replica_group()
-            if self.local_cp_group.world_size != self.local_cp_size:
-                raise RuntimeError(
-                    "M3 indexer head-replica group size mismatch: "
-                    f"expected {self.local_cp_size}, got {self.local_cp_group.world_size}"
-                )
-            self.local_cp_rank = self.local_cp_group.rank_in_group
+        # 方案 B: full index-Q heads are replicated on every rank, so each rank
+        # projects all index-Q heads directly (no idx_q AllGather needed). The
+        # "local" heads owned by this rank are selected by logical_rank during
+        # the global top-k merge.
+        self.total_num_index_heads = total_num_index_heads or num_index_heads
+        self.num_index_head_replicas = num_index_head_replicas
+        # Number of KV heads in the index-K cache. M3 uses a single shared
+        # index-K head (MLAAttentionSpec(num_kv_heads=1)), so this is 1 and the
+        # cache is replicated across all TP ranks. The CP group size is
+        # tp_size // indexer_num_kv_heads; for M3 this equals tp_size, i.e.
+        # the CP group is the full TP group. Models with >1 index-K head would
+        # shard only across the ranks that replicate the same index-K head.
+        self.indexer_num_kv_heads = indexer_num_kv_heads
+        self.indexer_cp = envs.VLLM_ASCEND_MINIMAX_M3_INDEXER_CP
         self.index_cache = AscendMiniMaxM3IndexerCache(
             head_dim=index_head_dim,
             prefix=f"{prefix}.index_cache",
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
         )
+
+    def _decode_topk_cp_sharded(
+        self,
+        idx_q: torch.Tensor,
+        index_kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        decode_query_len: int,
+        max_decode_query_len: int,
+        cp_group: Any,
+        cp_size: int,
+        cp_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 方案 B: single-collective CP-sharded decode indexer. The index-Q
+        # projection weight is replicated on every rank (full heads), so idx_q
+        # is already full-head — no idx_q AllGather. Only the packed candidate
+        # AllGather remains. The CP group size is tp_size //
+        # indexer_num_kv_heads; for M3 (indexer_num_kv_heads=1) the CP group is
+        # the full TP group and cp_size == tp_size.
+        #
+        # Per-layer collectives (1):
+        #   1. AllGather(packed [scores|indices]) -- exchange candidates
+        # Score (FP32) and index (INT32) are packed via bitcast (NOT numeric
+        # conversion) so the INT32 index survives intact beyond 2^24.
+        full_idx_q = idx_q  # already full-head (replicated index-Q weight)
+
+        max_block_count = (max_seq_len + self.block_size - 1) // self.block_size
+        blocks_per_cp = (max_block_count + cp_size - 1) // cp_size
+        block_offset = cp_rank * blocks_per_cp
+        block_count = max(0, min(blocks_per_cp, max_block_count - block_offset))
+        local_block_table = block_table[
+            :, block_offset : block_offset + block_count
+        ].contiguous()
+        local_seq_lens = torch.clamp(
+            seq_lens - block_offset * self.block_size,
+            min=0,
+            max=block_count * self.block_size,
+        )
+
+        local_topk, local_scores = minimax_m3_index_decode(
+            full_idx_q,
+            index_kv_cache,
+            local_block_table,
+            local_seq_lens,
+            max_seq_len,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            full_idx_q.shape[1],
+            decode_query_len,
+            max_decode_query_len=max_decode_query_len,
+            sm_scale=self.scale,
+            block_offset=block_offset,
+            block_count=block_count,
+            global_seq_lens=seq_lens,
+            return_scores=True,
+        )
+        # Pack local scores (FP32) and indices (INT32) into a single FP32
+        # tensor, then AllGather once along the candidate axis. The index is
+        # bitcast (memory reinterpreted), never numerically cast to FP32.
+        packed = torch.empty(
+            (*local_scores.shape, 2),
+            dtype=torch.float32,
+            device=local_scores.device,
+        )
+        packed[..., 0].copy_(local_scores)
+        packed.view(torch.int32)[..., 1].copy_(local_topk)
+
+        gathered = cp_group.all_gather(packed.contiguous(), dim=-2)
+
+        gathered_scores = gathered[..., 0]
+        gathered_topk = gathered.view(torch.int32)[..., 1]
+
+        # Select this rank's local heads from the merged result. With replicated
+        # index-Q weights, multiple CP ranks may own the same logical head
+        # (head replica); use logical_rank = cp_rank // num_index_head_replicas
+        # to find this rank's head slice. For M3 (cp_group == tp_group),
+        # cp_rank == tp_rank.
+        local_head_count = self.num_index_heads
+        logical_rank = cp_rank // self.num_index_head_replicas
+        local_head_start = logical_rank * local_head_count
+        local_gathered_scores = gathered_scores.narrow(
+            0, local_head_start, local_head_count
+        )
+        _, merged_pos = torch.topk(
+            local_gathered_scores,
+            k=self.topk_blocks,
+            dim=-1,
+        )
+        local_gathered_topk = gathered_topk.narrow(
+            0, local_head_start, local_head_count
+        )
+        merged_topk = torch.gather(
+            local_gathered_topk, dim=-1, index=merged_pos
+        )
+        select_num_idx = _select_num_idx_from_topk(merged_topk)
+        return merged_topk, select_num_idx
 
     def forward(
         self,
@@ -641,36 +591,141 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         assert isinstance(index_md, AscendMiniMaxM3IndexerMetadata)
         num_tokens = index_md.num_actual_tokens
         nd = index_md.num_decode_tokens
-        iq = index_query[:num_tokens].view(
-            -1, self.num_index_heads, self.index_head_dim
-        )
         kv = _as_index_triton_kv_cache(self.index_cache.kv_cache)
 
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
         decode_select_num_idx: torch.Tensor | None = None
-        if index_md.num_decodes > 0:
-            d = index_md.decode
-            assert d is not None
-            decode_topk, decode_select_num_idx = minimax_m3_index_decode(
-                iq[:nd],
-                kv,
-                d.block_table,
-                d.seq_lens,
-                d.max_seq_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                d.decode_query_len,
-                d.max_decode_query_len,
-                sm_scale=self.scale,
+
+        if self.indexer_cp:
+            # CP ON: index-Q weights are full-head (replicated). View as
+            # full-head; pure-decode uses CP sharding, fallback slices local.
+            full_iq = index_query[:num_tokens].view(
+                -1, self.total_num_index_heads, self.index_head_dim
             )
-        if index_md.num_prefills > 0:
-            p = index_md.prefill
-            assert p is not None
-            local_cp = p.local_cp
-            if local_cp is None:
+            decode_iq = full_iq[:nd]
+            if index_md.num_decodes > 0:
+                d = index_md.decode
+                assert d is not None
+                if index_md.num_prefills == 0:
+                    cp_group = get_tp_group()
+                    cp_size = cp_group.world_size // self.indexer_num_kv_heads
+                    if cp_size > 1:
+                        decode_topk, decode_select_num_idx = (
+                            self._decode_topk_cp_sharded(
+                                decode_iq,
+                                kv,
+                                d.block_table,
+                                d.seq_lens,
+                                d.max_seq_len,
+                                d.decode_query_len,
+                                d.max_decode_query_len,
+                                cp_group,
+                                cp_size,
+                                cp_group.rank_in_group,
+                            )
+                        )
+                    else:
+                        local_head_start = (
+                            cp_group.rank_in_group
+                            // self.num_index_head_replicas
+                        ) * self.num_index_heads
+                        local_decode_iq = decode_iq.narrow(
+                            1, local_head_start, self.num_index_heads
+                        )
+                        decode_topk, decode_select_num_idx = minimax_m3_index_decode(
+                            local_decode_iq,
+                            kv,
+                            d.block_table,
+                            d.seq_lens,
+                            d.max_seq_len,
+                            self.topk_blocks,
+                            self.init_blocks,
+                            self.local_blocks,
+                            self.num_kv_heads,
+                            d.decode_query_len,
+                            d.max_decode_query_len,
+                            sm_scale=self.scale,
+                        )
+                else:
+                    tp_group = get_tp_group()
+                    local_head_start = (
+                        tp_group.rank_in_group
+                        // self.num_index_head_replicas
+                    ) * self.num_index_heads
+                    local_decode_iq = decode_iq.narrow(
+                        1, local_head_start, self.num_index_heads
+                    )
+                    decode_topk, decode_select_num_idx = minimax_m3_index_decode(
+                        local_decode_iq,
+                        kv,
+                        d.block_table,
+                        d.seq_lens,
+                        d.max_seq_len,
+                        self.topk_blocks,
+                        self.init_blocks,
+                        self.local_blocks,
+                        self.num_kv_heads,
+                        d.decode_query_len,
+                        d.max_decode_query_len,
+                        sm_scale=self.scale,
+                    )
+            if index_md.num_prefills > 0:
+                p = index_md.prefill
+                assert p is not None
+                local_head_start = (
+                    get_tp_group().rank_in_group
+                    // self.num_index_head_replicas
+                ) * self.num_index_heads
+                prefill_iq = full_iq[nd:].narrow(
+                    1, local_head_start, self.num_index_heads
+                )
+                score = minimax_m3_index_score(
+                    prefill_iq,
+                    kv,
+                    p.block_table,
+                    p.cu_seqlens_q,
+                    p.seq_lens,
+                    p.context_lens,
+                    p.max_query_len,
+                    p.max_seq_len,
+                    self.num_kv_heads,
+                )
+                prefill_topk = minimax_m3_index_topk(
+                    score,
+                    p.cu_seqlens_q,
+                    p.context_lens,
+                    p.max_query_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                )
+        else:
+            # CP OFF: exactly the original behavior. Local-head index-Q,
+            # single-rank decode, no CP, no extra GEMM, no narrow.
+            iq = index_query[:num_tokens].view(
+                -1, self.num_index_heads, self.index_head_dim
+            )
+            if index_md.num_decodes > 0:
+                d = index_md.decode
+                assert d is not None
+                decode_topk, decode_select_num_idx = minimax_m3_index_decode(
+                    iq[:nd],
+                    kv,
+                    d.block_table,
+                    d.seq_lens,
+                    d.max_seq_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    d.decode_query_len,
+                    d.max_decode_query_len,
+                    sm_scale=self.scale,
+                )
+            if index_md.num_prefills > 0:
+                p = index_md.prefill
+                assert p is not None
                 score = minimax_m3_index_score(
                     iq[nd:],
                     kv,
@@ -691,68 +746,6 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
                     self.init_blocks,
                     self.local_blocks,
                 )
-            else:
-                num_prefill_tokens = iq.shape[0] - nd
-                prefill_topk = torch.full(
-                    (
-                        self.num_index_heads,
-                        num_prefill_tokens,
-                        self.topk_blocks,
-                    ),
-                    -1,
-                    dtype=torch.int32,
-                    device=iq.device,
-                )
-                if local_cp.query_indices.numel() > 0:
-                    prefill_iq = iq[nd:]
-                    if prefill_iq.dtype == torch.float8_e4m3fn:
-                        # aclnnIndexSelect does not support FP8 E4M3. Both
-                        # dtypes are one byte, so select the unchanged payload
-                        # as uint8 and reinterpret it as FP8 afterwards.
-                        local_iq = torch.index_select(
-                            prefill_iq.view(torch.uint8),
-                            0,
-                            local_cp.query_indices,
-                        ).view(torch.float8_e4m3fn)
-                    else:
-                        local_iq = torch.index_select(
-                            prefill_iq,
-                            0,
-                            local_cp.query_indices,
-                        )
-                    local_score = minimax_m3_index_score(
-                        local_iq,
-                        kv,
-                        local_cp.block_table,
-                        local_cp.cu_seqlens_q,
-                        local_cp.seq_lens,
-                        local_cp.context_lens,
-                        local_cp.max_query_len,
-                        p.max_seq_len,
-                        self.num_kv_heads,
-                    )
-                    local_topk = minimax_m3_index_topk(
-                        local_score,
-                        local_cp.cu_seqlens_q,
-                        local_cp.context_lens,
-                        local_cp.max_query_len,
-                        self.topk_blocks,
-                        self.init_blocks,
-                        self.local_blocks,
-                    )
-                    prefill_topk.index_copy_(
-                        1,
-                        local_cp.query_indices,
-                        local_topk,
-                    )
-                assert self.local_cp_group is not None
-                # Every pseudo request is owned by one local-CP rank. The
-                # remaining rows stay -1, so MAX restores the full top-k tensor.
-                dist.all_reduce(
-                    prefill_topk,
-                    op=dist.ReduceOp.MAX,
-                    group=self.local_cp_group.device_group,
-                )
         return decode_topk, prefill_topk, decode_select_num_idx
 
 
@@ -771,7 +764,9 @@ class AscendMiniMaxM3Indexer(nn.Module):
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: str = "bf16",
-        head_replica_size: int = 1,
+        indexer_num_kv_heads: int = 1,
+        total_num_index_heads: int | None = None,
+        num_index_head_replicas: int = 1,
     ) -> None:
         super().__init__()
         self.impl = AscendMiniMaxM3IndexerImpl(
@@ -786,7 +781,9 @@ class AscendMiniMaxM3Indexer(nn.Module):
             local_blocks=local_blocks,
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
-            head_replica_size=head_replica_size,
+            indexer_num_kv_heads=indexer_num_kv_heads,
+            total_num_index_heads=total_num_index_heads,
+            num_index_head_replicas=num_index_head_replicas,
         )
 
     @property
@@ -1208,6 +1205,7 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         bias: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        replicate_index_q: bool = False,
     ) -> None:
         assert total_num_index_heads == total_num_kv_heads, (
             "AscendMinimaxM3QKVParallelLinearWithIndexer requires "
@@ -1220,6 +1218,7 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         self.total_num_index_heads = total_num_index_heads
         self.index_head_size = index_head_size
+        self.replicate_index_q = replicate_index_q
 
         tp_size = get_tensor_model_parallel_world_size()
         self.num_heads = divide(self.total_num_heads, tp_size)
@@ -1233,7 +1232,10 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
         q = self.num_heads * self.head_size
         kv = self.num_kv_heads * self.head_size
-        iq = self.num_index_heads * self.index_head_size
+        if self.replicate_index_q:
+            iq = self.total_num_index_heads * self.index_head_size
+        else:
+            iq = self.num_index_heads * self.index_head_size
         ik = self.index_head_size
         self.output_sizes = [
             q * tp_size,
@@ -1271,7 +1273,8 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
         h = self.head_size
-        nq, nkv, nidx = self.num_heads, self.num_kv_heads, self.num_index_heads
+        nq, nkv = self.num_heads, self.num_kv_heads
+        nidx = self.total_num_index_heads if self.replicate_index_q else self.num_index_heads
         return {
             "q": 0,
             "k": nq * h,
@@ -1282,11 +1285,15 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
     def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
         h = self.head_size
+        if self.replicate_index_q:
+            index_q_size = self.total_num_index_heads * h
+        else:
+            index_q_size = self.num_index_heads * h
         return {
             "q": self.num_heads * h,
             "k": self.num_kv_heads * h,
             "v": self.num_kv_heads * h,
-            "index_q": self.num_index_heads * h,
+            "index_q": index_q_size,
             "index_k": self.index_head_size,
         }.get(loaded_shard_id)
 
@@ -1308,9 +1315,16 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
-        num_heads = (
-            self.tp_size if loaded_shard_id == "index_k" else self.num_kv_head_replicas
-        )
+        if self.replicate_index_q:
+            num_heads = (
+                self.tp_size
+                if loaded_shard_id in ("index_q", "index_k")
+                else self.num_kv_head_replicas
+            )
+        else:
+            num_heads = (
+                self.tp_size if loaded_shard_id == "index_k" else self.num_kv_head_replicas
+            )
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
             num_heads=num_heads,
@@ -1345,6 +1359,8 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             shard_rank = self.tp_rank
         elif loaded_shard_id == "index_k":
             shard_rank = 0
+        elif self.replicate_index_q and loaded_shard_id == "index_q":
+            shard_rank = 0
         else:
             shard_rank = self.tp_rank // self.num_kv_head_replicas
         loaded_weight = loaded_weight.narrow(
@@ -1352,6 +1368,226 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+
+
+class AscendMiniMaxM3IndexerLinear(AscendColumnParallelLinear):
+    """Merged [index_q | index_k] projection for M3 sparse layers.
+
+    方案 B: index_q weight is replicated (full heads on every rank), so each
+    rank projects ALL index-Q heads directly, eliminating the per-layer
+    idx_q AllGather. index_k remains replicated as before.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        total_num_index_heads: int,
+        index_head_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        replicate_index_q: bool = False,
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.total_num_index_heads = total_num_index_heads
+        self.index_head_size = index_head_size
+        self.replicate_index_q = replicate_index_q
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size >= self.total_num_index_heads:
+            self.num_index_heads = 1
+            self.num_index_head_replicas = divide(tp_size, self.total_num_index_heads)
+        else:
+            self.num_index_heads = divide(self.total_num_index_heads, tp_size)
+            self.num_index_head_replicas = 1
+
+        if self.replicate_index_q:
+            self.index_q_size = self.total_num_index_heads * self.index_head_size
+        else:
+            self.index_q_size = self.num_index_heads * self.index_head_size
+        self.index_k_size = self.index_head_size
+        self.output_sizes = [
+            self.index_q_size * tp_size,
+            self.index_k_size * tp_size,
+        ]
+
+        self.custom_op, _, _ = get_parallel_op(False, prefix, self, "column")
+        AscendColumnParallelLinear.__init__(
+            self,
+            input_size=self.hidden_size,
+            output_size=sum(self.output_sizes),
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(self, input_):
+        if self.custom_op is not None:
+            return self.custom_op.apply(input_)
+        return super().forward(input_)
+
+    def validate_shard_id(self, loaded_shard_id: str | None) -> None:
+        if loaded_shard_id is None:
+            return
+        if loaded_shard_id not in ("index_q", "index_k"):
+            raise ValueError(
+                f"Shard id for AscendMiniMaxM3IndexerLinear must be one of "
+                f"'index_q', 'index_k'; got {loaded_shard_id}."
+            )
+
+    def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
+        return {
+            "index_q": 0,
+            "index_k": self.index_q_size,
+        }.get(loaded_shard_id)
+
+    def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
+        return {
+            # 方案 B: load the full index-Q weight on every rank (replicated).
+            "index_q": self.index_q_size,
+            "index_k": self.index_k_size,
+        }.get(loaded_shard_id)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("index_q", "index_k")
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        if self.replicate_index_q:
+            num_heads = self.tp_size
+        else:
+            num_heads = (
+                self.tp_size if loaded_shard_id == "index_k" else self.num_index_head_replicas
+            )
+        param.load_qkv_weight(
+            loaded_weight=loaded_weight,
+            num_heads=num_heads,
+            shard_id=loaded_shard_id,
+            shard_offset=shard_offset,
+            shard_size=shard_size,
+            tp_rank=self.tp_rank,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("index_q", "index_k")
+        output_dim = getattr(param, "output_dim", None)
+        assert output_dim is not None
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+        assert shard_size is not None
+
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+        if self.replicate_index_q:
+            shard_rank = 0
+        elif loaded_shard_id == "index_k":
+            shard_rank = 0
+        else:
+            shard_rank = self.tp_rank // self.num_index_head_replicas
+        loaded_weight = loaded_weight.narrow(
+            output_dim, shard_rank * shard_size, shard_size
+        )
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+
+def _quant_description_value(
+    quant_config: QuantizationConfig | None,
+    key: str,
+) -> Any | None:
+    quant_description = getattr(quant_config, "quant_description", None)
+    if not isinstance(quant_description, dict):
+        return None
+    return quant_description.get(key)
+
+
+def _sparse_proj_quant_type(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    proj_name: str,
+) -> Any | None:
+    candidates = [prefix]
+    if not prefix.startswith("language_model."):
+        candidates.append(f"language_model.{prefix}")
+    if prefix.startswith("model."):
+        candidates.append(f"language_model.{prefix}")
+
+    for candidate in dict.fromkeys(candidates):
+        value = _quant_description_value(
+            quant_config,
+            f"{candidate}.{proj_name}.weight",
+        )
+        if value is not None:
+            return value
+    return None
+
+
+def _use_fused_qkv_indexer(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> bool:
+    if quant_config is None:
+        return True
+
+    qkv_types = [
+        _sparse_proj_quant_type(quant_config, prefix, proj_name)
+        for proj_name in ("q_proj", "k_proj", "v_proj")
+    ]
+    index_q_type = _sparse_proj_quant_type(quant_config, prefix, "index_q_proj")
+    index_k_type = _sparse_proj_quant_type(quant_config, prefix, "index_k_proj")
+
+    if any(value is None for value in (*qkv_types, index_q_type, index_k_type)):
+        return True
+    if len(set(qkv_types)) != 1:
+        raise ValueError(
+            f"MiniMax M3 q/k/v quantization types differ for {prefix}: {qkv_types}"
+        )
+    if index_q_type != index_k_type:
+        raise ValueError(
+            f"MiniMax M3 index_q/index_k quantization types differ for "
+            f"{prefix}: {index_q_type} vs {index_k_type}"
+        )
+    return qkv_types[0] == index_q_type
+
+
+def _register_m3_sparse_packed_modules(
+    quant_config: QuantizationConfig | None,
+    fused_qkv_indexer: bool,
+) -> None:
+    if quant_config is None:
+        return
+    packed_modules_mapping = getattr(quant_config, "packed_modules_mapping", None)
+    if not isinstance(packed_modules_mapping, dict):
+        return
+    packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+    if not fused_qkv_indexer:
+        packed_modules_mapping["indexer_proj"] = ["index_q_proj", "index_k_proj"]
 
 
 class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
@@ -1403,19 +1639,55 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             "sparse_num_index_heads == num_key_value_heads"
         )
         self.num_idx_heads = self.num_kv_heads
-        self.index_q_size = self.num_idx_heads * self.idx_head_dim
-
-        self.qkv_proj = AscendMinimaxM3QKVParallelLinearWithIndexer(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            self.total_idx_heads,
-            self.idx_head_dim,
-            bias=qkv_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+        self.total_num_idx_heads = self.total_idx_heads
+        self.num_index_head_replicas = (
+            tp_size // self.total_num_kv_heads
+            if tp_size >= self.total_num_kv_heads
+            else 1
         )
+        # CP switch: when ON, index-Q weights are replicated (full heads); when
+        # OFF, use original local-head weights — zero overhead, zero degradation.
+        self.indexer_cp = envs.VLLM_ASCEND_MINIMAX_M3_INDEXER_CP
+        if self.indexer_cp:
+            self.index_q_size = self.total_idx_heads * self.idx_head_dim
+        else:
+            self.index_q_size = self.num_idx_heads * self.idx_head_dim
+        self._use_fused_qkv_indexer = _use_fused_qkv_indexer(quant_config, prefix)
+        _register_m3_sparse_packed_modules(quant_config, self._use_fused_qkv_indexer)
+
+        if self._use_fused_qkv_indexer:
+            self.qkv_proj = AscendMinimaxM3QKVParallelLinearWithIndexer(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                self.total_idx_heads,
+                self.idx_head_dim,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+                replicate_index_q=self.indexer_cp,
+            )
+            self.indexer_proj = None
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.indexer_proj = AscendMiniMaxM3IndexerLinear(
+                hidden_size,
+                self.total_idx_heads,
+                self.idx_head_dim,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.indexer_proj",
+                replicate_index_q=self.indexer_cp,
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -1473,7 +1745,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             cache_config=cache_config,
             indexer_kv_dtype=self.indexer_kv_dtype,
-            head_replica_size=self.qkv_proj.num_kv_head_replicas,
+            indexer_num_kv_heads=1,
+            total_num_index_heads=self.total_num_idx_heads if self.indexer_cp else None,
+            num_index_head_replicas=self.num_index_head_replicas if self.indexer_cp else 1,
         )
 
         compilation_config = vllm_config.compilation_config
@@ -1486,10 +1760,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         if not _SPARSE_ATTN_LOGGED:
             logger.warning(
                 "MiniMax M3 sparse attention enabled "
-                "(topk_blocks=%d, block_size=%d, local_index_cp=%d)",
+                "(topk_blocks=%d, block_size=%d)",
                 sparse_cfg["sparse_topk_blocks"],
                 sparse_cfg["sparse_block_size"],
-                self.qkv_proj.num_kv_head_replicas,
             )
             _SPARSE_ATTN_LOGGED = True
 
@@ -1561,10 +1834,18 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv, _ = self.qkv_proj(hidden_states)
-        main_qkv_size = self.q_size + 2 * self.kv_size
-        main_qkv = qkv.narrow(-1, 0, main_qkv_size)
-        index_q = qkv.narrow(-1, main_qkv_size, self.index_q_size)
-        index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
+        if self.indexer_proj is None:
+            # Fused: index_q/index_k are inside the qkv output.
+            main_qkv_size = self.q_size + 2 * self.kv_size
+            main_qkv = qkv.narrow(-1, 0, main_qkv_size)
+            index_q = qkv.narrow(-1, main_qkv_size, self.index_q_size)
+            index_k = qkv.narrow(-1, main_qkv_size + self.index_q_size, self.idx_head_dim)
+        else:
+            # Standalone: index_q/index_k from a separate projection.
+            main_qkv = qkv
+            index_qk, _ = self.indexer_proj(hidden_states)
+            index_q = index_qk.narrow(-1, 0, self.index_q_size)
+            index_k = index_qk.narrow(-1, self.index_q_size, self.idx_head_dim)
 
         if (
             True

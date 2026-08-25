@@ -755,6 +755,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
+            # Standalone indexer_proj path (when QKV and indexer use different
+            # quantization types).
+            (".indexer_proj", ".index_q_proj", "index_q"),
+            (".indexer_proj", ".index_k_proj", "index_k"),
+            # Fused QKV+indexer path (when same quantization type).
             (".qkv_proj", ".index_q_proj", "index_q"),
             (".qkv_proj", ".index_k_proj", "index_k"),
             (".gate_up_proj", ".gate_proj", 0),
@@ -936,6 +941,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEa
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "indexer_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.w1", "experts.0.w2", "experts.0.w3"],
     }
