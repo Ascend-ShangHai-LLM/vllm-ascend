@@ -10,7 +10,11 @@ import torch
 import torch_npu
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -62,6 +66,7 @@ from vllm_ascend.attention.msa_m3_ops import (
     minimax_m3_sparse_attn_decode_torch as minimax_m3_sparse_attn_decode,
 )
 import vllm_ascend.ops.minimax_m3_sparse  # noqa: F401
+from vllm_ascend import envs
 from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
 
@@ -439,6 +444,9 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: str = "bf16",
+        indexer_num_kv_heads: int = 1,
+        total_num_index_heads: int | None = None,
+        num_index_head_replicas: int = 1,
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -449,12 +457,124 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         self.local_blocks = local_blocks
         self.num_index_heads = num_index_heads
         self.index_head_dim = index_head_dim
+        # 方案 B: full index-Q heads are replicated on every rank, so each rank
+        # projects all index-Q heads directly (no idx_q AllGather needed). The
+        # "local" heads owned by this rank are selected by logical_rank during
+        # the global top-k merge.
+        self.total_num_index_heads = total_num_index_heads or num_index_heads
+        self.num_index_head_replicas = num_index_head_replicas
+        # Number of KV heads in the index-K cache. M3 uses a single shared
+        # index-K head (MLAAttentionSpec(num_kv_heads=1)), so this is 1 and the
+        # cache is replicated across all TP ranks. The CP group size is
+        # tp_size // indexer_num_kv_heads; for M3 this equals tp_size, i.e.
+        # the CP group is the full TP group. Models with >1 index-K head would
+        # shard only across the ranks that replicate the same index-K head.
+        self.indexer_num_kv_heads = indexer_num_kv_heads
+        self.indexer_cp = envs.VLLM_ASCEND_MINIMAX_M3_INDEXER_CP
         self.index_cache = AscendMiniMaxM3IndexerCache(
             head_dim=index_head_dim,
             prefix=f"{prefix}.index_cache",
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
         )
+
+    def _decode_topk_cp_sharded(
+        self,
+        idx_q: torch.Tensor,
+        index_kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        decode_query_len: int,
+        max_decode_query_len: int,
+        cp_group: Any,
+        cp_size: int,
+        cp_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 方案 B: single-collective CP-sharded decode indexer. The index-Q
+        # projection weight is replicated on every rank (full heads), so idx_q
+        # is already full-head — no idx_q AllGather. Only the packed candidate
+        # AllGather remains. The CP group size is tp_size //
+        # indexer_num_kv_heads; for M3 (indexer_num_kv_heads=1) the CP group is
+        # the full TP group and cp_size == tp_size.
+        #
+        # Per-layer collectives (1):
+        #   1. AllGather(packed [scores|indices]) -- exchange candidates
+        # Score (FP32) and index (INT32) are packed via bitcast (NOT numeric
+        # conversion) so the INT32 index survives intact beyond 2^24.
+        full_idx_q = idx_q  # already full-head (replicated index-Q weight)
+
+        max_block_count = (max_seq_len + self.block_size - 1) // self.block_size
+        blocks_per_cp = (max_block_count + cp_size - 1) // cp_size
+        block_offset = cp_rank * blocks_per_cp
+        block_count = max(0, min(blocks_per_cp, max_block_count - block_offset))
+        local_block_table = block_table[
+            :, block_offset : block_offset + block_count
+        ].contiguous()
+        local_seq_lens = torch.clamp(
+            seq_lens - block_offset * self.block_size,
+            min=0,
+            max=block_count * self.block_size,
+        )
+
+        local_topk, local_scores = minimax_m3_index_decode(
+            full_idx_q,
+            index_kv_cache,
+            local_block_table,
+            local_seq_lens,
+            max_seq_len,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            full_idx_q.shape[1],
+            decode_query_len,
+            max_decode_query_len=max_decode_query_len,
+            sm_scale=self.scale,
+            block_offset=block_offset,
+            block_count=block_count,
+            global_seq_lens=seq_lens,
+            return_scores=True,
+        )
+        # Pack local scores (FP32) and indices (INT32) into a single FP32
+        # tensor, then AllGather once along the candidate axis. The index is
+        # bitcast (memory reinterpreted), never numerically cast to FP32.
+        packed = torch.empty(
+            (*local_scores.shape, 2),
+            dtype=torch.float32,
+            device=local_scores.device,
+        )
+        packed[..., 0].copy_(local_scores)
+        packed.view(torch.int32)[..., 1].copy_(local_topk)
+
+        gathered = cp_group.all_gather(packed.contiguous(), dim=-2)
+
+        gathered_scores = gathered[..., 0]
+        gathered_topk = gathered.view(torch.int32)[..., 1]
+
+        # Select this rank's local heads from the merged result. With replicated
+        # index-Q weights, multiple CP ranks may own the same logical head
+        # (head replica); use logical_rank = cp_rank // num_index_head_replicas
+        # to find this rank's head slice. For M3 (cp_group == tp_group),
+        # cp_rank == tp_rank.
+        local_head_count = self.num_index_heads
+        logical_rank = cp_rank // self.num_index_head_replicas
+        local_head_start = logical_rank * local_head_count
+        local_gathered_scores = gathered_scores.narrow(
+            0, local_head_start, local_head_count
+        )
+        _, merged_pos = torch.topk(
+            local_gathered_scores,
+            k=self.topk_blocks,
+            dim=-1,
+        )
+        local_gathered_topk = gathered_topk.narrow(
+            0, local_head_start, local_head_count
+        )
+        merged_topk = torch.gather(
+            local_gathered_topk, dim=-1, index=merged_pos
+        )
+        select_num_idx = _select_num_idx_from_topk(merged_topk)
+        return merged_topk, select_num_idx
 
     def forward(
         self,
@@ -471,8 +591,11 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         assert isinstance(index_md, AscendMiniMaxM3IndexerMetadata)
         num_tokens = index_md.num_actual_tokens
         nd = index_md.num_decode_tokens
-        iq = index_query[:num_tokens].view(
-            -1, self.num_index_heads, self.index_head_dim
+        # 方案 B: index-Q projection weight is replicated, so index_query
+        # carries ALL index heads on every rank. View as full-head for the
+        # pure-decode CP path; the prefill/mixed fallback slices to local heads.
+        full_iq = index_query[:num_tokens].view(
+            -1, self.total_num_index_heads, self.index_head_dim
         )
         kv = _as_index_triton_kv_cache(self.index_cache.kv_cache)
 
@@ -482,25 +605,94 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         if index_md.num_decodes > 0:
             d = index_md.decode
             assert d is not None
-            decode_topk, decode_select_num_idx = minimax_m3_index_decode(
-                iq[:nd],
-                kv,
-                d.block_table,
-                d.seq_lens,
-                d.max_seq_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                d.decode_query_len,
-                d.max_decode_query_len,
-                sm_scale=self.scale,
-            )
+            decode_iq = full_iq[:nd]
+            if (
+                self.indexer_cp
+                and index_md.num_prefills == 0
+            ):
+                # CP switch is ON: shard the Index-K sequence-block range
+                # across the CP group. For M3 the index-K cache is a single
+                # shared head (indexer_num_kv_heads=1), so the CP group is the
+                # full TP group and cp_size == tp_size.
+                cp_group = get_tp_group()
+                cp_size = cp_group.world_size // self.indexer_num_kv_heads
+                if cp_size > 1:
+                    # Pure decode: pass full-head idx_q (no AllGather needed).
+                    decode_topk, decode_select_num_idx = (
+                        self._decode_topk_cp_sharded(
+                            decode_iq,
+                            kv,
+                            d.block_table,
+                            d.seq_lens,
+                            d.max_seq_len,
+                            d.decode_query_len,
+                            d.max_decode_query_len,
+                            cp_group,
+                            cp_size,
+                            cp_group.rank_in_group,
+                        )
+                    )
+                else:
+                    # cp_size == 1: slice to local heads, single-rank decode.
+                    local_head_start = (
+                        cp_group.rank_in_group
+                        // self.num_index_head_replicas
+                    ) * self.num_index_heads
+                    local_decode_iq = decode_iq.narrow(
+                        1, local_head_start, self.num_index_heads
+                    )
+                    decode_topk, decode_select_num_idx = minimax_m3_index_decode(
+                        local_decode_iq,
+                        kv,
+                        d.block_table,
+                        d.seq_lens,
+                        d.max_seq_len,
+                        self.topk_blocks,
+                        self.init_blocks,
+                        self.local_blocks,
+                        self.num_kv_heads,
+                        d.decode_query_len,
+                        d.max_decode_query_len,
+                        sm_scale=self.scale,
+                    )
+            else:
+                # CP switch is OFF (or mixed prefill+decode): slice to local
+                # heads and run single-rank decode.
+                tp_group = get_tp_group()
+                local_head_start = (
+                    tp_group.rank_in_group
+                    // self.num_index_head_replicas
+                ) * self.num_index_heads
+                local_decode_iq = decode_iq.narrow(
+                    1, local_head_start, self.num_index_heads
+                )
+                decode_topk, decode_select_num_idx = minimax_m3_index_decode(
+                    local_decode_iq,
+                    kv,
+                    d.block_table,
+                    d.seq_lens,
+                    d.max_seq_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    d.decode_query_len,
+                    d.max_decode_query_len,
+                    sm_scale=self.scale,
+                )
         if index_md.num_prefills > 0:
             p = index_md.prefill
             assert p is not None
+            # Prefill: slice to this rank's local heads.
+            local_head_start = (
+                get_tp_group().rank_in_group
+                // self.num_index_head_replicas
+            ) * self.num_index_heads
+            prefill_iq = full_iq[nd:].narrow(
+                1, local_head_start, self.num_index_heads
+            )
             score = minimax_m3_index_score(
-                iq[nd:],
+                prefill_iq,
                 kv,
                 p.block_table,
                 p.cu_seqlens_q,
@@ -537,6 +729,9 @@ class AscendMiniMaxM3Indexer(nn.Module):
         local_blocks: int = 0,
         cache_config: CacheConfig | None = None,
         indexer_kv_dtype: str = "bf16",
+        indexer_num_kv_heads: int = 1,
+        total_num_index_heads: int | None = None,
+        num_index_head_replicas: int = 1,
     ) -> None:
         super().__init__()
         self.impl = AscendMiniMaxM3IndexerImpl(
@@ -551,6 +746,9 @@ class AscendMiniMaxM3Indexer(nn.Module):
             local_blocks=local_blocks,
             cache_config=cache_config,
             indexer_kv_dtype=indexer_kv_dtype,
+            indexer_num_kv_heads=indexer_num_kv_heads,
+            total_num_index_heads=total_num_index_heads,
+            num_index_head_replicas=num_index_head_replicas,
         )
 
     @property
@@ -997,7 +1195,9 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
         q = self.num_heads * self.head_size
         kv = self.num_kv_heads * self.head_size
-        iq = self.num_index_heads * self.index_head_size
+        # 方案 B: index-Q weight is replicated — each rank projects ALL index
+        # heads (full width), eliminating the per-layer idx_q AllGather.
+        iq = self.total_num_index_heads * self.index_head_size
         ik = self.index_head_size
         self.output_sizes = [
             q * tp_size,
@@ -1035,13 +1235,16 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
         h = self.head_size
-        nq, nkv, nidx = self.num_heads, self.num_kv_heads, self.num_index_heads
+        nq, nkv = self.num_heads, self.num_kv_heads
+        # 方案 B: index_q is full-head (replicated), so index_k offset uses
+        # total_num_index_heads, not the local num_index_heads.
+        total_nidx = self.total_num_index_heads
         return {
             "q": 0,
             "k": nq * h,
             "v": (nq + nkv) * h,
             "index_q": (nq + 2 * nkv) * h,
-            "index_k": (nq + 2 * nkv + nidx) * h,
+            "index_k": (nq + 2 * nkv + total_nidx) * h,
         }.get(loaded_shard_id)
 
     def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
@@ -1050,7 +1253,8 @@ class AscendMinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             "q": self.num_heads * h,
             "k": self.num_kv_heads * h,
             "v": self.num_kv_heads * h,
-            "index_q": self.num_index_heads * h,
+            # 方案 B: load the full index-Q weight on every rank (replicated).
+            "index_q": self.total_num_index_heads * h,
             "index_k": self.index_head_size,
         }.get(loaded_shard_id)
 
@@ -1167,7 +1371,15 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             "sparse_num_index_heads == num_key_value_heads"
         )
         self.num_idx_heads = self.num_kv_heads
-        self.index_q_size = self.num_idx_heads * self.idx_head_dim
+        # 方案 B: index-Q projection weight is replicated (full heads on every
+        # rank), so index_q_size uses the full index-head count.
+        self.total_num_idx_heads = self.total_idx_heads
+        self.num_index_head_replicas = (
+            tp_size // self.total_num_kv_heads
+            if tp_size >= self.total_num_kv_heads
+            else 1
+        )
+        self.index_q_size = self.total_idx_heads * self.idx_head_dim
 
         self.qkv_proj = AscendMinimaxM3QKVParallelLinearWithIndexer(
             hidden_size,
@@ -1237,6 +1449,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             cache_config=cache_config,
             indexer_kv_dtype=self.indexer_kv_dtype,
+            indexer_num_kv_heads=1,
+            total_num_index_heads=self.total_num_idx_heads,
+            num_index_head_replicas=self.num_index_head_replicas,
         )
 
         compilation_config = vllm_config.compilation_config
